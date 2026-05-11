@@ -1,36 +1,32 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Inject } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { CACHE_MANAGER } from '@nestjs/cache-manager';
+import type { Cache } from 'cache-manager';
 import axios from 'axios';
 import { maskSecret } from '../utils/mask-secret.util';
 
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
-  
-  private cachedToken: string | null = null;
-  private tokenExpirationTime: number | null = null;
+  private readonly TOKEN_CACHE_KEY = 'amazon_sp_api_token';
 
-  constructor(private configService: ConfigService) {}
+  constructor(
+    private configService: ConfigService,
+    @Inject(CACHE_MANAGER) private cacheManager: Cache,
+  ) {}
 
   async getAccessToken(): Promise<string> {
-    const safetyBufferMs = 5 * 60 * 1000;
-    const currentTimeMs = Date.now();
-
-    if (
-      this.cachedToken &&
-      this.tokenExpirationTime &&
-      this.tokenExpirationTime - currentTimeMs > safetyBufferMs
-    ) {
-      return this.cachedToken;
+    const cached = await this.cacheManager.get<string>(this.TOKEN_CACHE_KEY);
+    if (cached) {
+      return cached;
     }
 
     return this.fetchNewToken();
   }
 
-  clearTokenCache() {
+  async clearTokenCache() {
     this.logger.warn('Invalidating SP-API access token cache due to unauthorized error.');
-    this.cachedToken = null;
-    this.tokenExpirationTime = null;
+    await this.cacheManager.del(this.TOKEN_CACHE_KEY);
   }
 
   private async fetchNewToken(): Promise<string> {
@@ -52,11 +48,14 @@ export class AuthService {
       });
 
       const data = response.data;
-      this.cachedToken = data.access_token;
-      this.tokenExpirationTime = Date.now() + (data.expires_in * 1000);
+      const accessToken = data.access_token;
+      // Subtract 5 minutes from expiry for safety buffer
+      const ttlMs = (data.expires_in - 300) * 1000;
       
-      this.logger.log(`Successfully fetched new LWA token.`);
-      return this.cachedToken as string;
+      await this.cacheManager.set(this.TOKEN_CACHE_KEY, accessToken, ttlMs);
+      
+      this.logger.log(`Successfully fetched and cached new LWA token.`);
+      return accessToken;
     } catch (error: any) {
       const errorMsg = JSON.stringify(error.response?.data || error.message);
       this.logger.error('Failed to fetch new SP-API access token', maskSecret(errorMsg));

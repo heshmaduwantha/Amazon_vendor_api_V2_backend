@@ -1,21 +1,20 @@
-import { Body, Controller, HttpCode, HttpStatus, Post } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, HttpStatus, Post } from '@nestjs/common';
 import { SyncService } from './sync.service';
+import { ManualSyncDto } from './dto/manual-sync.dto';
 
 @Controller('sync')
 export class SyncController {
   constructor(private readonly syncService: SyncService) {}
 
+  @Get('status')
+  async getStatus() {
+    return await this.syncService.getSyncStatus();
+  }
+
   @Post('manual')
   @HttpCode(HttpStatus.ACCEPTED)
-  async manualSync(@Body() body: { startDate: string; endDate: string }) {
+  async manualSync(@Body() body: ManualSyncDto) {
     const { startDate, endDate } = body;
-
-    if (!startDate || !endDate) {
-      return {
-        message: 'startDate and endDate are required in the request body.',
-        status: HttpStatus.BAD_REQUEST,
-      };
-    }
 
     // Fire and forget so we don't hold the HTTP connection open for large syncs
     this.syncService.executeSync(startDate, endDate).catch(() => {
