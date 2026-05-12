@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import axios, { AxiosRequestConfig, AxiosResponse } from 'axios';
 import * as aws4 from 'aws4';
 import { URL } from 'url';
@@ -11,7 +12,10 @@ export class AmazonApiService {
   private readonly logger = new Logger(AmazonApiService.name);
   private nextAllowedRequestTime: number = 0;
 
-  constructor(private readonly authService: AuthService) {}
+  constructor(
+    private readonly authService: AuthService,
+    private readonly configService: ConfigService,
+  ) {}
 
   normalizeDate(date: string | Date, type: 'start' | 'end'): string {
     return normalizeDateToUTC(date, type);
@@ -27,21 +31,34 @@ export class AmazonApiService {
     accessToken: string,
     data?: any,
   ): AxiosRequestConfig {
+    const useSigV4 = this.configService.get<string>('USE_SIGV4') !== 'false';
     const credentials = this.authService.getAwsCredentials();
 
+    const headers: Record<string, string> = {
+      'x-amz-access-token': accessToken,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    };
+
+    if (!useSigV4) {
+      this.logger.debug(`[Auth] Using LWA-only authentication (SigV4 disabled).`);
+      return {
+        method,
+        url: url.toString(),
+        headers,
+        data,
+      };
+    }
+
     if (!credentials.accessKeyId || !credentials.secretAccessKey) {
-      throw new Error('Missing SP_API_AWS_ACCESS_KEY_ID or SP_API_AWS_SECRET_ACCESS_KEY.');
+      throw new Error('Missing SP_API_AWS_ACCESS_KEY_ID or SP_API_AWS_SECRET_ACCESS_KEY while SigV4 is enabled.');
     }
 
     const signOptions: aws4.Request = {
       host: url.host,
       path: url.pathname + url.search,
       method: method,
-      headers: {
-        'x-amz-access-token': accessToken,
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-      },
+      headers,
       region: credentials.region,
       service: 'execute-api',
     };

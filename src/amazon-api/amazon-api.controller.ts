@@ -1,5 +1,6 @@
-import { Controller, Get, ForbiddenException } from '@nestjs/common';
+import { Controller, Get, ForbiddenException, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { AmazonApiService } from './amazon-api.service';
 import * as aws4 from 'aws4';
 
 /**
@@ -13,7 +14,12 @@ import * as aws4 from 'aws4';
  */
 @Controller('amazon-api')
 export class AmazonApiController {
-  constructor(private readonly configService: ConfigService) {}
+  private readonly logger = new Logger(AmazonApiController.name);
+
+  constructor(
+    private readonly configService: ConfigService,
+    private readonly amazonApiService: AmazonApiService,
+  ) {}
 
   @Get('sigv4-smoke-test')
   sigV4SmokeTest() {
@@ -71,5 +77,52 @@ export class AmazonApiController {
         ? signedHeaders['Authorization'].split(' ')[0]  // e.g. "AWS4-HMAC-SHA256"
         : null,
     };
+  }
+
+  /**
+   * Experimental LWA-Only Auth Test
+   * 
+   * Calls /sellers/v1/marketplaceParticipations to verify if LWA-only
+   * authentication is sufficient.
+   */
+  @Get('auth-test')
+  async authTest() {
+    // ── Production guard ──────────────────────────────────────────────────────
+    if (this.configService.get<string>('NODE_ENV') === 'production') {
+      throw new ForbiddenException(
+        'Auth test endpoint is disabled in production.',
+      );
+    }
+
+    const useSigV4 = this.configService.get<string>('USE_SIGV4') !== 'false';
+    const endpoint = '/sellers/v1/marketplaceParticipations';
+
+    this.logger.log(`[Experimental] Starting Auth Test. Mode: ${useSigV4 ? 'SigV4' : 'LWA-Only'}`);
+
+    try {
+      const response = await this.amazonApiService.makeRequest('GET', endpoint);
+      
+      return {
+        ok: true,
+        mode: useSigV4 ? 'SigV4' : 'LWA-Only',
+        message: 'Authorization successful.',
+        data: response,
+      };
+    } catch (error: any) {
+      const status = error.response?.status;
+      const amazonErrorCode = error.response?.data?.errors?.[0]?.code || 'UNKNOWN';
+      const reason = error.response?.data?.errors?.[0]?.message || error.message;
+
+      this.logger.error(`[Auth-Test] Failure. Status: ${status}, AmazonCode: ${amazonErrorCode}, Reason: ${reason}`);
+
+      return {
+        ok: false,
+        mode: useSigV4 ? 'SigV4' : 'LWA-Only',
+        status,
+        amazonErrorCode,
+        reason: reason,
+        sigV4Required: status === 403 && amazonErrorCode === 'AccessDenied',
+      };
+    }
   }
 }
