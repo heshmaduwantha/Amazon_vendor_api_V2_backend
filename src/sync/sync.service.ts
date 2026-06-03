@@ -197,8 +197,9 @@ export class SyncService implements OnModuleInit {
   /**
    * Forecast report sync — every Friday at midnight Pacific
    * Cron: '0 0 * * 5'
+   * DISABLED — Forecast sync not active. Uncomment @Cron to re-enable.
    */
-  @Cron('0 0 * * 5')
+  // @Cron('0 0 * * 5')
   async handleWeeklyForecastSync(): Promise<void> {
     this.logger.log('[CRON] Weekly Forecast Sync triggered (Friday)');
     try {
@@ -404,7 +405,7 @@ export class SyncService implements OnModuleInit {
     let   end   = new Date(endDate);
     const now   = new Date();
     const ninetyDaysAgo = new Date();
-    ninetyDaysAgo.setDate(now.getDate() - 90);
+    ninetyDaysAgo.setDate(now.getDate() - 365);
 
     if (isNaN(start.getTime()) || isNaN(end.getTime()))
       throw new BadRequestException('startDate and endDate must be valid ISO date strings.');

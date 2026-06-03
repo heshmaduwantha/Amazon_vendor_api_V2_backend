@@ -1,0 +1,1 @@
+import { PrismaClient } from '@prisma/client'; const prisma = new PrismaClient(); prisma.amazonSalesAggregate.findMany({orderBy: {startDate: 'desc'}, take: 7, select: {startDate: true, endDate: true}}).then(res => { console.log(res); process.exit(0); });

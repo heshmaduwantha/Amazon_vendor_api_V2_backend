@@ -390,8 +390,27 @@ export class AmazonApiService {
       const endpoint = `/reports/2021-06-30/reports?${qs.toString()}`;
       const response = await this.makeRequest('GET', endpoint);
       const reports: any[] = response.reports ?? [];
+
+      // Amazon sometimes ignores dataStartTime/dataEndTime for vendor reports
+      // and returns current-period reports instead of historical ones.
+      // Validate each report's actual data period before accepting it.
+      const reqStart = new Date(dataStartTime).getTime();
+      const reqEnd   = new Date(dataEndTime).getTime();
+      const filtered = reports.filter((r: any) => {
+        if (!r.dataStartTime || !r.dataEndTime) return false;
+        return new Date(r.dataStartTime).getTime() >= reqStart &&
+               new Date(r.dataEndTime).getTime()   <= reqEnd;
+      });
+
+      if (reports.length > 0 && filtered.length === 0) {
+        this.logger.warn(
+          `[Reports] Amazon returned ${reports.length} pre-generated report(s) but none matched ` +
+          `requested period ${dataStartTime} → ${dataEndTime}. Falling back to on-demand creation.`,
+        );
+      }
+
       // Newest first
-      return reports.sort((a, b) =>
+      return filtered.sort((a: any, b: any) =>
         new Date(b.createdTime).getTime() - new Date(a.createdTime).getTime(),
       );
     });

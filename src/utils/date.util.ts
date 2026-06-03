@@ -39,29 +39,25 @@ export function getLastSevenDays(): { startDate: string; endDate: string } {
 }
 
 /**
- * Phase 3 — Last COMPLETED Mon→Sun week, with a data-finalization lag buffer.
+ * Last COMPLETED Sun→Sat week, with a data-finalization lag buffer.
+ *
+ * Amazon Vendor Central defines weeks as Sunday → Saturday.
+ * Example: Week 1 of 2026 = Dec 28, 2025 (Sun) → Jan 3, 2026 (Sat)
  *
  * Amazon vendor data is typically finalized 1–3 days after the event date.
  * Using a lagDays buffer ensures we only request data that Amazon has had
  * time to finalize — so our numbers match the Vendor Central portal.
  *
  * Algorithm:
- *   1. Find cutoff = today − lagDays
- *   2. Walk back to the most recent Sunday on or before cutoff  (week end)
- *   3. Monday of that same week = Sunday − 6 days              (week start)
+ *   1. cutoff    = today − lagDays
+ *   2. weekEnd   = last Saturday on or before cutoff  (6 = Saturday)
+ *   3. weekStart = Sunday of same week = Saturday − 6 days
  *
- * Example (today = Wed 2026-05-27, lagDays = 3):
- *   cutoff     = Sun 2026-05-24
- *   weekEnd    = Sun 2026-05-24  (cutoff IS a Sunday)
- *   weekStart  = Mon 2026-05-18
- *   → returns 2026-05-18T00:00:00Z → 2026-05-24T23:59:59Z  ✅
- *
- * Example (today = Mon 2026-05-25, lagDays = 3):
- *   cutoff     = Fri 2026-05-22
- *   weekEnd    = Sun 2026-05-17  (walk back from Friday to last Sunday)
- *   weekStart  = Mon 2026-05-11
- *   → returns 2026-05-11T00:00:00Z → 2026-05-17T23:59:59Z  ✅
- *   (conservative: last week is too recent to be finalized on Monday)
+ * Example (today = Wed 2026-06-04, lagDays = 3):
+ *   cutoff     = Sun 2026-06-01
+ *   weekEnd    = Sat 2026-05-30  (walk back from Sun to last Saturday)
+ *   weekStart  = Sun 2026-05-24
+ *   → returns 2026-05-24T00:00:00Z → 2026-05-30T23:59:59Z  ✅
  */
 export function getLastCompletedWeek(lagDays = 3): { startDate: string; endDate: string } {
   const now = new Date();
@@ -71,14 +67,13 @@ export function getLastCompletedWeek(lagDays = 3): { startDate: string; endDate:
     Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - lagDays),
   );
 
-  // Step 2: walk back to last Sunday (0 = Sunday in getUTCDay)
-  const dowCutoff = cutoff.getUTCDay();
+  // Step 2: walk back to last Saturday (6 = Saturday in getUTCDay)
+  const dowCutoff = cutoff.getUTCDay(); // 0=Sun, 1=Mon, ... 6=Sat
+  const daysToSat = (dowCutoff + 1) % 7; // days since last Saturday
   const weekEnd   = new Date(cutoff);
-  if (dowCutoff !== 0) {
-    weekEnd.setUTCDate(cutoff.getUTCDate() - dowCutoff);
-  }
+  weekEnd.setUTCDate(cutoff.getUTCDate() - daysToSat);
 
-  // Step 3: Monday of same week = Sunday - 6
+  // Step 3: Sunday of same week = Saturday - 6
   const weekStart = new Date(weekEnd);
   weekStart.setUTCDate(weekEnd.getUTCDate() - 6);
 

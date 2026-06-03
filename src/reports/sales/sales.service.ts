@@ -83,22 +83,37 @@ export class SalesService {
     // ── Step 1: look for reports Amazon has already generated ─────────────────
     if (onStageChange) await onStageChange('REQUESTING_REPORT');
 
-    const existingReports = await this.amazonApiService.listExistingReports(
-      reportType, marketplaceId, normalizedStartDate, normalizedEndDate,
-    );
+    const reportOptions = buildSalesReportOptions(this.configService);
+    this.logger.log(`[Sales] reportOptions: ${JSON.stringify(reportOptions)}`);
 
-    let documentIds: string[] = existingReports
-      .map((r: any) => r.reportDocumentId)
-      .filter(Boolean)
-      .slice(0, 3); // 3 most-recent only — each getReportDocument = 1 quota slot; burst limit = 15
+    // FORCE ON-DEMAND FOR ALL MANUAL SYNCS
+    // Relying on pre-generated reports for large historical backfills causes missing data
+    // because Amazon paginates them, deletes older ones, and fragments them into daily chunks.
+    const forceOnDemand = true;
 
-    if (documentIds.length > 0) {
-      this.logger.log(`[Sales] Found ${existingReports.length} pre-generated report(s) — processing ${documentIds.length} most recent.`);
+    let documentIds: string[] = [];
+
+    if (!forceOnDemand) {
+      const existingReports = await this.amazonApiService.listExistingReports(
+        reportType, marketplaceId, normalizedStartDate, normalizedEndDate,
+      );
+      documentIds = existingReports
+        .map((r: any) => r.reportDocumentId)
+        .filter(Boolean)
+        .slice(0, 3); // 3 most-recent only — each getReportDocument = 1 quota slot; burst limit = 15
+
+      if (documentIds.length > 0) {
+        this.logger.log(`[Sales] Found ${existingReports.length} pre-generated report(s) — processing ${documentIds.length} most recent.`);
+      }
     } else {
-      // ── Fallback: create a new on-demand report ─────────────────────────────
-      this.logger.warn(`[Sales] No pre-generated reports found. Attempting on-demand creation...`);
-      const reportOptions = buildSalesReportOptions(this.configService);
-      this.logger.log(`[Sales] reportOptions: ${JSON.stringify(reportOptions)}`);
+      this.logger.log(`[Sales] distributorView=${reportOptions.distributorView}: skipping pre-generated reports, creating on-demand report.`);
+    }
+
+    if (documentIds.length === 0) {
+      // ── On-demand report creation ───────────────────────────────────────────
+      if (!forceOnDemand) {
+        this.logger.warn(`[Sales] No pre-generated reports found. Attempting on-demand creation...`);
+      }
 
       const { reportId } = await this.amazonApiService.createReport(
         reportType, [marketplaceId],
