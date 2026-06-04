@@ -72,6 +72,7 @@ export class SalesService {
     startDate: string,
     endDate: string,
     onStageChange?: (stage: any) => Promise<void>,
+    checkCancelled?: () => Promise<void>,
   ): Promise<void> {
     const normalizedStartDate = this.amazonApiService.normalizeDate(startDate, 'start');
     const normalizedEndDate   = this.amazonApiService.normalizeDate(endDate,   'end');
@@ -122,7 +123,7 @@ export class SalesService {
       );
       this.logger.log(`[Sales] Report created. reportId: ${reportId}`);
 
-      const docId = await this.pollUntilDone(reportId, onStageChange);
+      const docId = await this.pollUntilDone(reportId, onStageChange, checkCancelled);
       this.logger.log(`[Sales] Report DONE. documentId: ${docId}`);
       documentIds = [docId];
     }
@@ -162,11 +163,16 @@ export class SalesService {
   private async pollUntilDone(
     reportId: string,
     onStageChange?: (stage: any) => Promise<void>,
+    checkCancelled?: () => Promise<void>,
     maxAttempts = 30,
     intervalMs = 10000,
   ): Promise<string> {
     let lastReportStatus = '';
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      // Cooperative cancellation — checked every poll iteration so Stop is
+      // responsive even while the report sits in Amazon's queue. Throws if cancelled.
+      if (checkCancelled) await checkCancelled();
+
       const report = await this.amazonApiService.getReport(reportId);
       const processingStatus: string = report.processingStatus;
 
@@ -206,7 +212,13 @@ export class SalesService {
         throw new Error(`[Sales] Report ${reportId} status: ${processingStatus}. See logs for Amazon's error document.`);
       }
 
-      await new Promise(resolve => setTimeout(resolve, intervalMs));
+      // Interruptible wait: sleep in 1s slices, checking for cancellation between
+      // them so a Stop request doesn't have to wait out the full poll interval.
+      const slices = Math.ceil(intervalMs / 1000);
+      for (let s = 0; s < slices; s++) {
+        if (checkCancelled) await checkCancelled();
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
     }
     throw new Error(`[Sales] Report ${reportId} did not complete within ${maxAttempts * intervalMs / 1000}s`);
   }

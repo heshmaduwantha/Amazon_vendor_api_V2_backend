@@ -56,11 +56,26 @@ export interface CombinedSyncStatus {
 const KEYS = {
   SALES_STATUS:      'sync_status_sales',
   SALES_LOCK:        'sync_lock_sales',
+  SALES_CANCEL:      'sync_cancel_sales',
   INVENTORY_STATUS:  'sync_status_inventory',
   INVENTORY_LOCK:    'sync_lock_inventory',
+  INVENTORY_CANCEL:  'sync_cancel_inventory',
   FORECAST_STATUS:   'sync_status_forecast',
   FORECAST_LOCK:     'sync_lock_forecast',
 } as const;
+
+/**
+ * Thrown from a stage callback when a user has requested cancellation.
+ * Caught in execute*Sync to mark the run as cancelled (not failed) and
+ * swallow the rejection. Cancellation is cooperative: it takes effect at the
+ * next pipeline stage boundary, since SP-API calls run to completion.
+ */
+class SyncCancelledError extends Error {
+  constructor() {
+    super('Sync cancelled by user.');
+    this.name = 'SyncCancelledError';
+  }
+}
 
 const ONE_DAY_MS  = 86_400_000;
 const ONE_HOUR_MS =  3_600_000;
@@ -225,6 +240,7 @@ export class SyncService implements OnModuleInit {
     }
 
     await this.cacheManager.set(KEYS.SALES_LOCK, 'true', ONE_HOUR_MS * 4);
+    await this.cacheManager.del(KEYS.SALES_CANCEL); // clear any stale cancel flag
 
     await this.updateSalesStatus({
       isSyncing: true,
@@ -245,6 +261,9 @@ export class SyncService implements OnModuleInit {
         startDate,
         endDate,
         async (stage) => await this.updateSalesStage(stage as SyncStage),
+        async () => {
+          if (await this.cacheManager.get(KEYS.SALES_CANCEL)) throw new SyncCancelledError();
+        },
       );
 
       const durationMs = Date.now() - t0;
@@ -258,6 +277,18 @@ export class SyncService implements OnModuleInit {
         nextScheduledAt: nextWeekday(3),
       });
     } catch (error: any) {
+      if (error instanceof SyncCancelledError) {
+        this.logger.warn('[Sales] Sync cancelled by user.');
+        await this.updateSalesStatus({
+          isSyncing: false,
+          currentStage: SyncStage.IDLE,
+          lastSyncFinishedAt: new Date().toISOString(),
+          lastSyncStatus: 'IDLE',
+          lastError: 'Sync cancelled by user.',
+          nextScheduledAt: nextWeekday(3),
+        });
+        return; // cancellation is not a failure — swallow
+      }
       this.logger.error('[Sales] Sync failed', error.stack || error.message);
       await this.updateSalesStatus({
         isSyncing: false,
@@ -270,6 +301,7 @@ export class SyncService implements OnModuleInit {
       throw error;
     } finally {
       await this.cacheManager.del(KEYS.SALES_LOCK);
+      await this.cacheManager.del(KEYS.SALES_CANCEL);
     }
   }
 
@@ -289,6 +321,7 @@ export class SyncService implements OnModuleInit {
     }
 
     await this.cacheManager.set(KEYS.INVENTORY_LOCK, 'true', ONE_HOUR_MS * 4);
+    await this.cacheManager.del(KEYS.INVENTORY_CANCEL); // clear any stale cancel flag
 
     await this.updateInventoryStatus({
       isSyncing: true,
@@ -309,6 +342,9 @@ export class SyncService implements OnModuleInit {
         startDate,
         endDate,
         async (stage) => await this.updateInventoryStage(stage as SyncStage),
+        async () => {
+          if (await this.cacheManager.get(KEYS.INVENTORY_CANCEL)) throw new SyncCancelledError();
+        },
       );
 
       const durationMs = Date.now() - t0;
@@ -322,6 +358,18 @@ export class SyncService implements OnModuleInit {
         nextScheduledAt: nextWeekday(0),
       });
     } catch (error: any) {
+      if (error instanceof SyncCancelledError) {
+        this.logger.warn('[Inventory] Sync cancelled by user.');
+        await this.updateInventoryStatus({
+          isSyncing: false,
+          currentStage: SyncStage.IDLE,
+          lastSyncFinishedAt: new Date().toISOString(),
+          lastSyncStatus: 'IDLE',
+          lastError: 'Sync cancelled by user.',
+          nextScheduledAt: nextWeekday(0),
+        });
+        return; // cancellation is not a failure — swallow
+      }
       this.logger.error('[Inventory] Sync failed', error.stack || error.message);
       await this.updateInventoryStatus({
         isSyncing: false,
@@ -334,6 +382,7 @@ export class SyncService implements OnModuleInit {
       throw error;
     } finally {
       await this.cacheManager.del(KEYS.INVENTORY_LOCK);
+      await this.cacheManager.del(KEYS.INVENTORY_CANCEL);
     }
   }
 
@@ -366,6 +415,10 @@ export class SyncService implements OnModuleInit {
   // ── Private Status Updaters ────────────────────────────────────────────────
 
   private async updateSalesStage(stage: SyncStage): Promise<void> {
+    // Cooperative cancellation checkpoint — abort before entering the next stage.
+    if (await this.cacheManager.get(KEYS.SALES_CANCEL)) {
+      throw new SyncCancelledError();
+    }
     this.logger.log(`[Sales] Stage → ${stage}`);
     const current = await this.getSalesStatus();
     await this.updateSalesStatus({
@@ -375,12 +428,47 @@ export class SyncService implements OnModuleInit {
   }
 
   private async updateInventoryStage(stage: SyncStage): Promise<void> {
+    // Cooperative cancellation checkpoint — abort before entering the next stage.
+    if (await this.cacheManager.get(KEYS.INVENTORY_CANCEL)) {
+      throw new SyncCancelledError();
+    }
     this.logger.log(`[Inventory] Stage → ${stage}`);
     const current = await this.getInventoryStatus();
     await this.updateInventoryStatus({
       currentStage: stage,
       stageTimestamps: { ...current.stageTimestamps, [stage]: new Date().toISOString() },
     });
+  }
+
+  // ── Cancellation ────────────────────────────────────────────────────────────
+
+  /**
+   * Request cancellation of an in-flight Sales sync. Cooperative: sets a flag
+   * that the pipeline checks at the next stage boundary, then releases the lock
+   * (cleared in execute*Sync's finally). No-op if nothing is running.
+   */
+  async cancelSalesSync(): Promise<{ cancelled: boolean; message: string }> {
+    const isLocked = await this.cacheManager.get(KEYS.SALES_LOCK);
+    if (!isLocked) {
+      return { cancelled: false, message: 'No sales sync is currently running.' };
+    }
+    await this.cacheManager.set(KEYS.SALES_CANCEL, 'true', ONE_HOUR_MS * 4);
+    this.logger.warn('[Sales] Cancellation requested — will stop at the next stage boundary.');
+    return { cancelled: true, message: 'Cancellation requested. The sync will stop at the next stage.' };
+  }
+
+  /**
+   * Request cancellation of an in-flight Inventory sync. Same cooperative model
+   * as cancelSalesSync.
+   */
+  async cancelInventorySync(): Promise<{ cancelled: boolean; message: string }> {
+    const isLocked = await this.cacheManager.get(KEYS.INVENTORY_LOCK);
+    if (!isLocked) {
+      return { cancelled: false, message: 'No inventory sync is currently running.' };
+    }
+    await this.cacheManager.set(KEYS.INVENTORY_CANCEL, 'true', ONE_HOUR_MS * 4);
+    this.logger.warn('[Inventory] Cancellation requested — will stop at the next stage boundary.');
+    return { cancelled: true, message: 'Cancellation requested. The sync will stop at the next stage.' };
   }
 
   private async updateSalesStatus(patch: Partial<ReportSyncStatus>): Promise<void> {

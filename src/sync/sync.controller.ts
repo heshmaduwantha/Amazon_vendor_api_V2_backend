@@ -155,6 +155,29 @@ export class SyncController {
     };
   }
 
+  // ── Cancellation Endpoints ────────────────────────────────────────────────
+
+  /**
+   * POST /sync/cancel/sales
+   * Request cancellation of an in-flight Sales sync (cooperative — stops at the
+   * next pipeline stage boundary). Returns { cancelled, message }.
+   */
+  @Post('cancel/sales')
+  @HttpCode(HttpStatus.OK)
+  async cancelSalesSync() {
+    return this.syncService.cancelSalesSync();
+  }
+
+  /**
+   * POST /sync/cancel/inventory
+   * Request cancellation of an in-flight Inventory sync.
+   */
+  @Post('cancel/inventory')
+  @HttpCode(HttpStatus.OK)
+  async cancelInventorySync() {
+    return this.syncService.cancelInventorySync();
+  }
+
   /**
    * POST /sync/manual
    * Trigger both Sales + Inventory sequentially.

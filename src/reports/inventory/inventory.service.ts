@@ -58,6 +58,7 @@ export class InventoryService {
     startDate: string,
     endDate: string,
     onStageChange?: (stage: any) => Promise<void>,
+    checkCancelled?: () => Promise<void>,
   ): Promise<void> {
     const normalizedStartDate = this.amazonApiService.normalizeDate(startDate, 'start');
     const normalizedEndDate   = this.amazonApiService.normalizeDate(endDate,   'end');
@@ -93,7 +94,7 @@ export class InventoryService {
       );
       this.logger.log(`[Inventory] Report created. reportId: ${reportId}`);
 
-      const docId = await this.pollUntilDone(reportId, onStageChange);
+      const docId = await this.pollUntilDone(reportId, onStageChange, checkCancelled);
       this.logger.log(`[Inventory] Report DONE. documentId: ${docId}`);
       documentIds = [docId];
     }
@@ -129,11 +130,15 @@ export class InventoryService {
   private async pollUntilDone(
     reportId: string,
     onStageChange?: (stage: any) => Promise<void>,
+    checkCancelled?: () => Promise<void>,
     maxAttempts = 30,
     intervalMs = 10000,
   ): Promise<string> {
     let lastReportStatus = '';
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      // Cooperative cancellation — checked every poll iteration. Throws if cancelled.
+      if (checkCancelled) await checkCancelled();
+
       const report = await this.amazonApiService.getReport(reportId);
       const processingStatus: string = report.processingStatus;
 
@@ -164,7 +169,13 @@ export class InventoryService {
         );
       }
 
-      await new Promise(resolve => setTimeout(resolve, intervalMs));
+      // Interruptible wait: sleep in 1s slices, checking for cancellation between
+      // them so a Stop request lands within ~1s instead of after the full interval.
+      const slices = Math.ceil(intervalMs / 1000);
+      for (let s = 0; s < slices; s++) {
+        if (checkCancelled) await checkCancelled();
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
     }
     throw new Error(`[Inventory] Report ${reportId} did not complete within ${maxAttempts * intervalMs / 1000}s`);
   }
