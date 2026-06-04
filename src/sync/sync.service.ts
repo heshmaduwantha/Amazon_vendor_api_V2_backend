@@ -80,6 +80,34 @@ class SyncCancelledError extends Error {
 const ONE_DAY_MS  = 86_400_000;
 const ONE_HOUR_MS =  3_600_000;
 
+/**
+ * How long a FAILED run keeps surfacing its error to clients. The raw failure is
+ * still stored in cache (1-day TTL) for history, but after this window the public
+ * status view reports it as cleared (IDLE, lastError=null) so the dashboard's 5s
+ * poll auto-dismisses a stale error banner without a manual reload.
+ */
+const ERROR_VISIBLE_MS = 20 * 60 * 1000; // 20 minutes
+
+/**
+ * Read-time view transform: once a FAILED run is older than ERROR_VISIBLE_MS (and
+ * nothing is currently syncing), surface it as cleared while KEEPING accurate
+ * lastRun / duration history (lastSyncStartedAt / lastSyncFinishedAt / lastSyncPeriod).
+ * Pure — does not mutate the stored status. A new run starting overwrites raw status
+ * anyway, which clears the error immediately.
+ */
+function applyErrorExpiry(status: ReportSyncStatus): ReportSyncStatus {
+  if (status.lastSyncStatus !== 'FAILED' || status.isSyncing) return status;
+  const finishedAt = status.lastSyncFinishedAt;
+  if (!finishedAt) return status;
+  if (Date.now() - new Date(finishedAt).getTime() < ERROR_VISIBLE_MS) return status;
+  return {
+    ...status,
+    currentStage: SyncStage.IDLE,
+    lastSyncStatus: 'IDLE',
+    lastError: null,
+  };
+}
+
 // ─── Date window constants ────────────────────────────────────────────────────
 
 /** Days to lag behind today before including a day in the sync window.
@@ -145,17 +173,32 @@ export class SyncService implements OnModuleInit {
 
   // ── Public Status Getters ──────────────────────────────────────────────────
 
+  // Public getters apply the error-expiry view so all clients (dashboard poll,
+  // /sync/health) agree. Internal updaters read the raw stored status instead.
+
   async getSalesStatus(): Promise<ReportSyncStatus> {
+    return applyErrorExpiry(await this.getRawSalesStatus());
+  }
+
+  async getInventoryStatus(): Promise<ReportSyncStatus> {
+    return applyErrorExpiry(await this.getRawInventoryStatus());
+  }
+
+  async getForecastStatus(): Promise<ReportSyncStatus> {
+    return applyErrorExpiry(await this.getRawForecastStatus());
+  }
+
+  private async getRawSalesStatus(): Promise<ReportSyncStatus> {
     return (await this.cacheManager.get<ReportSyncStatus>(KEYS.SALES_STATUS))
       ?? initialStatus('sales');
   }
 
-  async getInventoryStatus(): Promise<ReportSyncStatus> {
+  private async getRawInventoryStatus(): Promise<ReportSyncStatus> {
     return (await this.cacheManager.get<ReportSyncStatus>(KEYS.INVENTORY_STATUS))
       ?? initialStatus('inventory');
   }
 
-  async getForecastStatus(): Promise<ReportSyncStatus> {
+  private async getRawForecastStatus(): Promise<ReportSyncStatus> {
     return (await this.cacheManager.get<ReportSyncStatus>(KEYS.FORECAST_STATUS))
       ?? initialStatus('forecast');
   }
@@ -420,7 +463,7 @@ export class SyncService implements OnModuleInit {
       throw new SyncCancelledError();
     }
     this.logger.log(`[Sales] Stage → ${stage}`);
-    const current = await this.getSalesStatus();
+    const current = await this.getRawSalesStatus();
     await this.updateSalesStatus({
       currentStage: stage,
       stageTimestamps: { ...current.stageTimestamps, [stage]: new Date().toISOString() },
@@ -433,7 +476,7 @@ export class SyncService implements OnModuleInit {
       throw new SyncCancelledError();
     }
     this.logger.log(`[Inventory] Stage → ${stage}`);
-    const current = await this.getInventoryStatus();
+    const current = await this.getRawInventoryStatus();
     await this.updateInventoryStatus({
       currentStage: stage,
       stageTimestamps: { ...current.stageTimestamps, [stage]: new Date().toISOString() },
@@ -472,17 +515,17 @@ export class SyncService implements OnModuleInit {
   }
 
   private async updateSalesStatus(patch: Partial<ReportSyncStatus>): Promise<void> {
-    const current = await this.getSalesStatus();
+    const current = await this.getRawSalesStatus();
     await this.cacheManager.set(KEYS.SALES_STATUS, { ...current, ...patch }, ONE_DAY_MS);
   }
 
   private async updateInventoryStatus(patch: Partial<ReportSyncStatus>): Promise<void> {
-    const current = await this.getInventoryStatus();
+    const current = await this.getRawInventoryStatus();
     await this.cacheManager.set(KEYS.INVENTORY_STATUS, { ...current, ...patch }, ONE_DAY_MS);
   }
 
   private async updateForecastStatus(patch: Partial<ReportSyncStatus>): Promise<void> {
-    const current = await this.getForecastStatus();
+    const current = await this.getRawForecastStatus();
     await this.cacheManager.set(KEYS.FORECAST_STATUS, { ...current, ...patch }, ONE_DAY_MS);
   }
 
