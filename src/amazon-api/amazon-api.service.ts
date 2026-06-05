@@ -232,10 +232,12 @@ export class AmazonApiService {
       Object.keys(params).forEach(key => urlObj.searchParams.append(key, params[key]));
     }
     
-    const MAX_RETRIES = 5;
+    const isReportDocumentEndpoint = endpoint.includes('/reports/2021-06-30/documents/');
+    const MAX_RETRIES = isReportDocumentEndpoint ? 8 : 5;
     const INITIAL_BACKOFF_MS = 1000;
     let attempt = 0;
     let hasClearedTokenCache = false;
+    let lastRetryError: any = null;
 
     while (attempt <= MAX_RETRIES) {
       try {
@@ -253,6 +255,7 @@ export class AmazonApiService {
         return response.data;
 
       } catch (error: any) {
+        lastRetryError = error;
         const status = error.response?.status;
         const errorData = JSON.stringify(error.response?.data || error.message);
         
@@ -272,7 +275,7 @@ export class AmazonApiService {
             // every makeRequest() call, so 3 different documents each returning
             // one 429 will NOT trigger fail-fast; only 3 retries of the SAME
             // request (total ~195s of waiting) signals a truly exhausted quota.
-            if (attempt >= 3 && (endpoint.includes('/documents/') || endpoint.includes('/reports/'))) {
+            if (attempt >= 3 && !isReportDocumentEndpoint && (endpoint.includes('/documents/') || endpoint.includes('/reports/'))) {
               this.logger.error(
                 `[RateLimit] Quota exhausted on ${endpoint} (${attempt} retries, all 429). ` +
                 `Failing fast — retry after quota refills (~15 min). ` +
@@ -284,6 +287,10 @@ export class AmazonApiService {
             let backoffMs = retryAfter
               ? (parseInt(retryAfter, 10) || 65) * 1000
               : endpoint.includes('/reports/') ? 65_000 : 30_000;
+
+            if (isReportDocumentEndpoint && attempt >= 3) {
+              backoffMs = 15 * 60 * 1000;
+            }
 
             this.logger.warn(`[RateLimit] 429 on ${endpoint}. Waiting ${backoffMs / 1000}s before retry ${attempt + 1}/${MAX_RETRIES}`);
             await this.delay(backoffMs);
@@ -317,7 +324,17 @@ export class AmazonApiService {
       }
     }
 
-    throw new Error('Unexpected exit from makeRequest retry loop');
+    if (lastRetryError?.response?.status === 429) {
+      const retryAfter = lastRetryError.response?.headers?.['retry-after'];
+      const retryHint = retryAfter
+        ? ` Amazon suggested retrying after ${retryAfter} seconds.`
+        : ' Wait for Amazon SP-API quota to refill, then retry.';
+      throw new Error(
+        `Amazon SP-API quota is still exhausted for ${endpoint} after ${MAX_RETRIES + 1} attempts.${retryHint}`,
+      );
+    }
+
+    throw new Error('Amazon SP-API request retry loop ended before a successful response.');
   }
 
   async fetchAllPages<T>(

@@ -21,8 +21,11 @@ export interface SalesTotals {
 export interface SalesSummaryResult {
   period:          { startDate: string; endDate: string };
   dailyAggregates: AmazonSalesAggregate[];
+  summaryRows:     AmazonSalesAggregate[];
   totals:          SalesTotals;
   rowCount:        number;
+  totalRowCount:   number;
+  summaryRowCount: number;
 }
 
 /**
@@ -192,24 +195,9 @@ export class SalesService {
       }
 
       if (['CANCELLED', 'FATAL'].includes(processingStatus)) {
-        this.logger.error(
-          `[Sales] Report ${processingStatus} — Amazon response:\n${JSON.stringify(report, null, 2)}`,
-        );
-
-        // Amazon often attaches an error document to FATAL reports — download it
-        // to get the human-readable reason (e.g. "No data available", "Invalid reportOptions")
-        if (report.reportDocumentId) {
-          try {
-            this.logger.log(`[Sales] Downloading FATAL error document: ${report.reportDocumentId}`);
-            const errDoc  = await this.amazonApiService.getReportDocument(report.reportDocumentId);
-            const errBody = await this.amazonApiService.downloadAndParseReport(errDoc.url, errDoc.compressionAlgorithm);
-            this.logger.error(`[Sales] FATAL error document contents:\n${JSON.stringify(errBody, null, 2)}`);
-          } catch (docErr: any) {
-            this.logger.warn(`[Sales] Could not fetch error document: ${docErr.message}`);
-          }
-        }
-
-        throw new Error(`[Sales] Report ${reportId} status: ${processingStatus}. See logs for Amazon's error document.`);
+        const message = await this.buildHumanReadableReportFailure(reportId, processingStatus, report);
+        this.logger.error(`[Sales] ${message}`);
+        throw new Error(message);
       }
 
       // Interruptible wait: sleep in 1s slices, checking for cancellation between
@@ -221,6 +209,91 @@ export class SalesService {
       }
     }
     throw new Error(`[Sales] Report ${reportId} did not complete within ${maxAttempts * intervalMs / 1000}s`);
+  }
+
+  private async buildHumanReadableReportFailure(
+    reportId: string,
+    processingStatus: string,
+    report: any,
+  ): Promise<string> {
+    const prefix = processingStatus === 'FATAL'
+      ? `Sales report ${reportId} failed at Amazon.`
+      : `Sales report ${reportId} was cancelled by Amazon.`;
+
+    if (processingStatus !== 'FATAL') {
+      return `${prefix} Try again after checking the selected date range.`;
+    }
+
+    if (!report?.reportDocumentId) {
+      return `${prefix} Amazon did not attach a readable error document. Check the date range and report options, then try again.`;
+    }
+
+    try {
+      this.logger.log(`[Sales] Downloading FATAL error document: ${report.reportDocumentId}`);
+      const errDoc = await this.amazonApiService.getReportDocument(report.reportDocumentId);
+      const errBody = await this.amazonApiService.downloadAndParseReport(errDoc.url, errDoc.compressionAlgorithm);
+      this.logger.error(`[Sales] FATAL error document contents:\n${JSON.stringify(errBody, null, 2)}`);
+
+      const amazonReason = this.humanizeReportErrorDocument(errBody);
+      if (amazonReason) return `${prefix} Amazon says: ${amazonReason}`;
+    } catch (docErr: any) {
+      this.logger.warn(`[Sales] Could not fetch FATAL error document: ${docErr.message}`);
+    }
+
+    return `${prefix} Could not read Amazon's error document. Check the date range and report options, then try again.`;
+  }
+
+  private humanizeReportErrorDocument(body: unknown): string | null {
+    const messages = this.collectReportErrorMessages(body)
+      .map(message => message.replace(/\s+/g, ' ').trim())
+      .filter(Boolean);
+
+    if (messages.length === 0) return null;
+
+    const uniqueMessages = [...new Set(messages)];
+    const text = uniqueMessages.join(' ');
+    return text.length > 600 ? `${text.slice(0, 597)}...` : text;
+  }
+
+  private collectReportErrorMessages(value: unknown): string[] {
+    if (value === null || value === undefined) return [];
+    if (typeof value === 'string') return [value];
+    if (typeof value === 'number' || typeof value === 'boolean') return [String(value)];
+    if (Array.isArray(value)) return value.flatMap(item => this.collectReportErrorMessages(item));
+    if (typeof value !== 'object') return [];
+
+    const record = value as Record<string, unknown>;
+    const code = this.stringifyErrorPart(record.code ?? record.Code);
+    const descriptionParts = [
+      this.stringifyErrorPart(record.message ?? record.Message ?? record.errorMessage),
+      this.stringifyErrorPart(record.reason ?? record.description),
+      this.stringifyErrorPart(record.details ?? record.detail),
+    ].filter(Boolean);
+    const directMessage = [
+      code ? `${code}:` : null,
+      descriptionParts.join(' '),
+    ].filter(Boolean).join(' ');
+
+    const nested = [
+      record.errors,
+      record.error,
+      record.errorDetails,
+      record.issues,
+      record.failures,
+    ].flatMap(item => this.collectReportErrorMessages(item));
+
+    return directMessage ? [directMessage, ...nested] : nested;
+  }
+
+  private stringifyErrorPart(value: unknown): string | null {
+    if (value === null || value === undefined) return null;
+    if (typeof value === 'string') return value;
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return null;
+    }
   }
 
   private async upsertSalesByAsin(records: any[]): Promise<void> {
@@ -320,21 +393,55 @@ export class SalesService {
       .getMany();
 
     const currency = aggregates[0]?.orderedRevenueCurrency ?? 'USD';
+    const summaryRows = aggregates.filter(row => !this.isSingleDayAggregate(row));
+    const dailyRows = aggregates.filter(row => this.isSingleDayAggregate(row));
+    // Amazon can return a weekly rollup beside the daily rows. Sum one grain only.
+    const rowsForTotals = dailyRows.length > 0 ? dailyRows : aggregates;
 
-    const totals: SalesTotals = aggregates.reduce(
+    const totals = this.sumSalesTotals(rowsForTotals, currency);
+
+    return {
+      period: { startDate, endDate },
+      dailyAggregates: aggregates,
+      summaryRows,
+      totals,
+      rowCount: aggregates.length,
+      totalRowCount: rowsForTotals.length,
+      summaryRowCount: summaryRows.length,
+    };
+  }
+
+  private isSingleDayAggregate(row: AmazonSalesAggregate): boolean {
+    return this.dateKey(row.startDate) === this.dateKey(row.endDate);
+  }
+
+  private dateKey(value: string): string {
+    return value.slice(0, 10);
+  }
+
+  private sumSalesTotals(rows: AmazonSalesAggregate[], currency: string): SalesTotals {
+    const totals = rows.reduce(
       (acc, row) => ({
-        orderedUnits:    acc.orderedUnits    + (row.orderedUnits           || 0),
+        orderedUnits:    acc.orderedUnits    + Number(row.orderedUnits || 0),
         orderedRevenue:  acc.orderedRevenue  + Number(row.orderedRevenueAmount  || 0),
-        shippedUnits:    acc.shippedUnits    + (row.shippedUnits           || 0),
+        shippedUnits:    acc.shippedUnits    + Number(row.shippedUnits || 0),
         shippedRevenue:  acc.shippedRevenue  + Number(row.shippedRevenueAmount  || 0),
         shippedCogs:     acc.shippedCogs     + Number(row.shippedCogsAmount     || 0),
-        customerReturns: acc.customerReturns + (row.customerReturns        || 0),
+        customerReturns: acc.customerReturns + Number(row.customerReturns || 0),
         currency,
       }),
       { orderedUnits: 0, orderedRevenue: 0, shippedUnits: 0, shippedRevenue: 0, shippedCogs: 0, customerReturns: 0, currency },
     );
+    return {
+      ...totals,
+      orderedRevenue: this.roundMoney(totals.orderedRevenue),
+      shippedRevenue: this.roundMoney(totals.shippedRevenue),
+      shippedCogs: this.roundMoney(totals.shippedCogs),
+    };
+  }
 
-    return { period: { startDate, endDate }, dailyAggregates: aggregates, totals, rowCount: aggregates.length };
+  private roundMoney(value: number): number {
+    return Math.round((value + Number.EPSILON) * 100) / 100;
   }
 
   /**

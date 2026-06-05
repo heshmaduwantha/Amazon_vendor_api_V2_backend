@@ -36,6 +36,12 @@ function buildInventoryReportOptions(configService: import('@nestjs/config').Con
 }
 
 const BATCH_SIZE = 500;
+const MAX_INVENTORY_DAY_REPORT_DAYS = 15;
+
+interface DateRange {
+  startDate: string;
+  endDate: string;
+}
 
 @Injectable()
 export class InventoryService {
@@ -70,36 +76,123 @@ export class InventoryService {
     // ── Step 1: look for reports Amazon has already generated ─────────────────
     if (onStageChange) await onStageChange('REQUESTING_REPORT');
 
-    const existingReports = await this.amazonApiService.listExistingReports(
-      reportType, marketplaceId, normalizedStartDate, normalizedEndDate,
+    const reportOptions = buildInventoryReportOptions(this.configService);
+    this.logger.log(`[Inventory] reportOptions: ${JSON.stringify(reportOptions)}`);
+
+    // Match Sales behavior: create on-demand reports for the requested range.
+    // Amazon caps DAY inventory reports at 15 days, so monthly manual pulls are
+    // split into smaller on-demand chunks and upserted into one logical result.
+    const forceOnDemand = true;
+    const reportRanges = this.getInventoryReportRanges(
+      startDate,
+      endDate,
+      reportOptions.reportPeriod,
     );
 
-    let documentIds: string[] = existingReports
-      .map((r: any) => r.reportDocumentId)
-      .filter(Boolean)
-      .slice(0, 3); // 3 most-recent only — each getReportDocument = 1 quota slot; burst limit = 15
+    let totalRows = 0;
 
-    if (documentIds.length > 0) {
-      this.logger.log(`[Inventory] Found ${existingReports.length} pre-generated report(s) — processing ${documentIds.length} most recent.`);
-    } else {
+    if (!forceOnDemand) {
+      const existingReports = await this.amazonApiService.listExistingReports(
+        reportType, marketplaceId, normalizedStartDate, normalizedEndDate,
+      );
+
+      const documentIds = existingReports
+        .map((r: any) => r.reportDocumentId)
+        .filter(Boolean)
+        .slice(0, 3); // 3 most-recent only — each getReportDocument = 1 quota slot; burst limit = 15
+
+      if (documentIds.length > 0) {
+        this.logger.log(`[Inventory] Found ${existingReports.length} pre-generated report(s) — processing ${documentIds.length} most recent.`);
+        totalRows += await this.downloadAndUpsertDocuments(
+          documentIds,
+          normalizedStartDate,
+          normalizedEndDate,
+          onStageChange,
+        );
+        this.logger.log(`[Inventory] Sync complete. Total rows: ${totalRows}`);
+        return;
+      }
+    }
+
+    for (const range of reportRanges) {
       // ── Fallback: create a new on-demand report ─────────────────────────────
-      this.logger.warn(`[Inventory] No pre-generated reports found. Attempting on-demand creation...`);
-      const reportOptions = buildInventoryReportOptions(this.configService);
-      this.logger.log(`[Inventory] reportOptions: ${JSON.stringify(reportOptions)}`);
+      if (!forceOnDemand) {
+        this.logger.warn(`[Inventory] No pre-generated reports found. Attempting on-demand creation...`);
+      } else {
+        this.logger.log(`[Inventory] Creating on-demand report for ${range.startDate} → ${range.endDate}.`);
+      }
+
+      const reportStartDate = this.amazonApiService.normalizeDate(range.startDate, 'start');
+      const reportEndDate = this.amazonApiService.normalizeDate(range.endDate, 'end');
 
       const { reportId } = await this.amazonApiService.createReport(
         reportType, [marketplaceId],
-        normalizedStartDate, normalizedEndDate,
+        reportStartDate, reportEndDate,
         reportOptions,
       );
       this.logger.log(`[Inventory] Report created. reportId: ${reportId}`);
 
       const docId = await this.pollUntilDone(reportId, onStageChange, checkCancelled);
       this.logger.log(`[Inventory] Report DONE. documentId: ${docId}`);
-      documentIds = [docId];
+
+      totalRows += await this.downloadAndUpsertDocuments(
+        [docId],
+        range.startDate,
+        range.endDate,
+        onStageChange,
+      );
     }
 
-    // ── Step 2: download + upsert each document ───────────────────────────────
+    this.logger.log(`[Inventory] Sync complete. Total rows: ${totalRows}`);
+  }
+
+  // ── Private Helpers ──────────────────────────────────────────────────────
+
+  private getInventoryReportRanges(
+    startDate: string,
+    endDate: string,
+    reportPeriod: string,
+  ): DateRange[] {
+    const startDay = startDate.slice(0, 10);
+    const endDay = endDate.slice(0, 10);
+    if (reportPeriod !== 'DAY') return [{ startDate: startDay, endDate: endDay }];
+
+    const ranges: DateRange[] = [];
+    const current = new Date(`${startDay}T00:00:00Z`);
+    const end = new Date(`${endDay}T00:00:00Z`);
+
+    if (Number.isNaN(current.getTime()) || Number.isNaN(end.getTime())) {
+      throw new Error(`Invalid Inventory report date range: ${startDate} → ${endDate}`);
+    }
+
+    while (current <= end) {
+      const chunkStart = new Date(current);
+      const chunkEnd = new Date(current);
+      chunkEnd.setUTCDate(chunkEnd.getUTCDate() + MAX_INVENTORY_DAY_REPORT_DAYS - 1);
+      if (chunkEnd > end) chunkEnd.setTime(end.getTime());
+
+      ranges.push({
+        startDate: this.toIsoDate(chunkStart),
+        endDate: this.toIsoDate(chunkEnd),
+      });
+
+      current.setTime(chunkEnd.getTime());
+      current.setUTCDate(current.getUTCDate() + 1);
+    }
+
+    return ranges;
+  }
+
+  private toIsoDate(date: Date): string {
+    return date.toISOString().slice(0, 10);
+  }
+
+  private async downloadAndUpsertDocuments(
+    documentIds: string[],
+    startDate: string,
+    endDate: string,
+    onStageChange?: (stage: any) => Promise<void>,
+  ): Promise<number> {
     let totalRows = 0;
 
     for (const docId of documentIds) {
@@ -117,15 +210,13 @@ export class InventoryService {
       totalRows += inventoryByAsin.length;
 
       if (onStageChange) await onStageChange('UPSERTING_DATABASE');
-      await this.upsertInventoryByAsin(inventoryByAsin, normalizedStartDate, normalizedEndDate);
+      await this.upsertInventoryByAsin(inventoryByAsin, startDate, endDate);
 
       this.logger.log(`[Inventory] Document ${docId} — rows: ${inventoryByAsin.length}`);
     }
 
-    this.logger.log(`[Inventory] Sync complete. Total rows: ${totalRows}`);
+    return totalRows;
   }
-
-  // ── Private Helpers ──────────────────────────────────────────────────────
 
   private async pollUntilDone(
     reportId: string,
@@ -158,15 +249,9 @@ export class InventoryService {
       }
 
       if (['CANCELLED', 'FATAL'].includes(processingStatus)) {
-        // Log full Amazon response — reveals WHY report was rejected
-        this.logger.error(
-          `[Inventory] Report FATAL — full Amazon response:\n${JSON.stringify(report, null, 2)}`,
-        );
-        throw new Error(
-          `[Inventory] Report ${reportId} failed with status: ${processingStatus}. ` +
-          `Check logs for full Amazon response. ` +
-          `Common fix: set VENDOR_DISTRIBUTOR_VIEW=MANUFACTURING in .env if you are a manufacturing vendor.`,
-        );
+        const message = await this.buildHumanReadableReportFailure(reportId, processingStatus, report);
+        this.logger.error(`[Inventory] ${message}`);
+        throw new Error(message);
       }
 
       // Interruptible wait: sleep in 1s slices, checking for cancellation between
@@ -178,6 +263,91 @@ export class InventoryService {
       }
     }
     throw new Error(`[Inventory] Report ${reportId} did not complete within ${maxAttempts * intervalMs / 1000}s`);
+  }
+
+  private async buildHumanReadableReportFailure(
+    reportId: string,
+    processingStatus: string,
+    report: any,
+  ): Promise<string> {
+    const prefix = processingStatus === 'FATAL'
+      ? `Inventory report ${reportId} failed at Amazon.`
+      : `Inventory report ${reportId} was cancelled by Amazon.`;
+
+    if (processingStatus !== 'FATAL') {
+      return `${prefix} Try again after checking the selected date range.`;
+    }
+
+    if (!report?.reportDocumentId) {
+      return `${prefix} Amazon did not attach a readable error document. Check the date range and inventory report options, then try again.`;
+    }
+
+    try {
+      this.logger.log(`[Inventory] Downloading FATAL error document: ${report.reportDocumentId}`);
+      const errDoc = await this.amazonApiService.getReportDocument(report.reportDocumentId);
+      const errBody = await this.amazonApiService.downloadAndParseReport(errDoc.url, errDoc.compressionAlgorithm);
+      this.logger.error(`[Inventory] FATAL error document contents:\n${JSON.stringify(errBody, null, 2)}`);
+
+      const amazonReason = this.humanizeReportErrorDocument(errBody);
+      if (amazonReason) return `${prefix} Amazon says: ${amazonReason}`;
+    } catch (docErr: any) {
+      this.logger.warn(`[Inventory] Could not fetch FATAL error document: ${docErr.message}`);
+    }
+
+    return `${prefix} Could not read Amazon's error document. Check the date range and inventory report options, then try again.`;
+  }
+
+  private humanizeReportErrorDocument(body: unknown): string | null {
+    const messages = this.collectReportErrorMessages(body)
+      .map(message => message.replace(/\s+/g, ' ').trim())
+      .filter(Boolean);
+
+    if (messages.length === 0) return null;
+
+    const uniqueMessages = [...new Set(messages)];
+    const text = uniqueMessages.join(' ');
+    return text.length > 600 ? `${text.slice(0, 597)}...` : text;
+  }
+
+  private collectReportErrorMessages(value: unknown): string[] {
+    if (value === null || value === undefined) return [];
+    if (typeof value === 'string') return [value];
+    if (typeof value === 'number' || typeof value === 'boolean') return [String(value)];
+    if (Array.isArray(value)) return value.flatMap(item => this.collectReportErrorMessages(item));
+    if (typeof value !== 'object') return [];
+
+    const record = value as Record<string, unknown>;
+    const code = this.stringifyErrorPart(record.code ?? record.Code);
+    const descriptionParts = [
+      this.stringifyErrorPart(record.message ?? record.Message ?? record.errorMessage),
+      this.stringifyErrorPart(record.reason ?? record.description),
+      this.stringifyErrorPart(record.details ?? record.detail),
+    ].filter(Boolean);
+    const directMessage = [
+      code ? `${code}:` : null,
+      descriptionParts.join(' '),
+    ].filter(Boolean).join(' ');
+
+    const nested = [
+      record.errors,
+      record.error,
+      record.errorDetails,
+      record.issues,
+      record.failures,
+    ].flatMap(item => this.collectReportErrorMessages(item));
+
+    return directMessage ? [directMessage, ...nested] : nested;
+  }
+
+  private stringifyErrorPart(value: unknown): string | null {
+    if (value === null || value === undefined) return null;
+    if (typeof value === 'string') return value;
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return null;
+    }
   }
 
   private async upsertInventoryByAsin(records: any[], startDate: string, endDate: string): Promise<void> {

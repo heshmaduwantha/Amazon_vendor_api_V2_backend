@@ -5,15 +5,40 @@ import {
   BadRequestException,
   Inject,
 } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
 import { OnModuleInit } from '@nestjs/common';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import type { Cache } from 'cache-manager';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
 import { SalesService } from '../reports/sales/sales.service';
 import { InventoryService } from '../reports/inventory/inventory.service';
-import { normalizeDateToUTC, getLastSevenDays, getLastCompletedWeek } from '../utils/date.util';
 import { maskSecret } from '../utils/mask-secret.util';
-import { pacificDayStartUtc, pacificDayEndUtc, addPacificDays } from '../utils/spapi-date.util';
+import {
+  AmazonWeekRange,
+  getPreviousCompletedAmazonWeeks,
+} from '../utils/amazon-week.util';
+import {
+  DEFAULT_INVENTORY_SCHEDULER_DAY,
+  DEFAULT_INVENTORY_SCHEDULER_TIME,
+  DEFAULT_INVENTORY_SCHEDULER_TIMEZONE,
+  DEFAULT_SALES_SCHEDULER_DAY,
+  DEFAULT_SALES_SCHEDULER_TIME,
+  DEFAULT_SALES_SCHEDULER_TIMEZONE,
+  WEEKDAY_LABELS,
+  nextScheduledRunUtc,
+  normalizeSchedulerConfig,
+  schedulerDisplayLabel,
+} from '../utils/scheduler-time.util';
+import {
+  SalesSchedulerSettingsEntity,
+  SalesSchedulerWeekRange,
+} from './entities/sales-scheduler-settings.entity';
+import {
+  InventorySchedulerSettingsEntity,
+  InventorySchedulerWeekRange,
+} from './entities/inventory-scheduler-settings.entity';
+import { UpdateInventorySchedulerSettingsDto } from './dto/update-inventory-scheduler-settings.dto';
+import { UpdateSalesSchedulerSettingsDto } from './dto/update-sales-scheduler-settings.dto';
 
 // ─── Stage Enum ──────────────────────────────────────────────────────────────
 
@@ -42,6 +67,7 @@ export interface ReportSyncStatus {
   lastError: string | null;
   stageTimestamps: Record<string, string>;
   lastSyncPeriod: { startDate: string; endDate: string } | null;
+  lastSyncPeriods?: AmazonWeekRange[] | null;
   nextScheduledAt: string;
 }
 
@@ -49,6 +75,38 @@ export interface CombinedSyncStatus {
   sales: ReportSyncStatus;
   inventory: ReportSyncStatus;
   forecast: ReportSyncStatus;
+}
+
+export interface SalesSchedulerStatus {
+  enabled: boolean;
+  dayOfWeek: number;
+  dayLabel: string;
+  timeOfDay: string;
+  timezone: string;
+  scheduleLabel: string;
+  nextScheduledAt: string | null;
+  lastRunStartedAt: string | null;
+  lastRunFinishedAt: string | null;
+  lastRunStatus: 'NEVER' | 'RUNNING' | 'SUCCESS' | 'FAILED';
+  lastRunError: string | null;
+  lastRunWeekRanges: SalesSchedulerWeekRange[] | null;
+  updatedAt: string | null;
+}
+
+export interface InventorySchedulerStatus {
+  enabled: boolean;
+  dayOfWeek: number;
+  dayLabel: string;
+  timeOfDay: string;
+  timezone: string;
+  scheduleLabel: string;
+  nextScheduledAt: string | null;
+  lastRunStartedAt: string | null;
+  lastRunFinishedAt: string | null;
+  lastRunStatus: 'NEVER' | 'RUNNING' | 'SUCCESS' | 'FAILED';
+  lastRunError: string | null;
+  lastRunWeekRanges: InventorySchedulerWeekRange[] | null;
+  updatedAt: string | null;
 }
 
 // ─── Cache Keys ───────────────────────────────────────────────────────────────
@@ -108,16 +166,25 @@ function applyErrorExpiry(status: ReportSyncStatus): ReportSyncStatus {
   };
 }
 
-// ─── Date window constants ────────────────────────────────────────────────────
-
-/** Days to lag behind today before including a day in the sync window.
- *  Amazon needs a few days to finalize Vendor data. */
-const LAG_DAYS = 4;
-
-/** How many days back to reconcile on each sync run. */
-const RECONCILIATION_DAYS = 14;
-
 // ─── Next-Run Helpers ─────────────────────────────────────────────────────────
+
+function defaultSalesNextScheduledAt(): string {
+  return nextScheduledRunUtc({
+    enabled: true,
+    dayOfWeek: DEFAULT_SALES_SCHEDULER_DAY,
+    timeOfDay: DEFAULT_SALES_SCHEDULER_TIME,
+    timezone: DEFAULT_SALES_SCHEDULER_TIMEZONE,
+  })?.toISOString() ?? '';
+}
+
+function defaultInventoryNextScheduledAt(): string {
+  return nextScheduledRunUtc({
+    enabled: true,
+    dayOfWeek: DEFAULT_INVENTORY_SCHEDULER_DAY,
+    timeOfDay: DEFAULT_INVENTORY_SCHEDULER_TIME,
+    timezone: DEFAULT_INVENTORY_SCHEDULER_TIMEZONE,
+  })?.toISOString() ?? '';
+}
 
 function nextWeekday(targetDay: number /* 0=Sun … 6=Sat */, hourUTC = 2): string {
   const now = new Date();
@@ -130,8 +197,8 @@ function nextWeekday(targetDay: number /* 0=Sun … 6=Sat */, hourUTC = 2): stri
 
 function initialStatus(reportType: 'sales' | 'inventory' | 'forecast'): ReportSyncStatus {
   const nextMap: Record<string, string> = {
-    sales:     nextWeekday(3),  // Wednesday
-    inventory: nextWeekday(0),  // Sunday
+    sales:     defaultSalesNextScheduledAt(),
+    inventory: defaultInventoryNextScheduledAt(),
     forecast:  nextWeekday(5),  // Friday
   };
   return {
@@ -153,15 +220,25 @@ function initialStatus(reportType: 'sales' | 'inventory' | 'forecast'): ReportSy
 @Injectable()
 export class SyncService implements OnModuleInit {
   private readonly logger = new Logger(SyncService.name);
+  private salesScheduleTimer: NodeJS.Timeout | null = null;
+  private inventoryScheduleTimer: NodeJS.Timeout | null = null;
 
   constructor(
     private readonly salesService: SalesService,
     private readonly inventoryService: InventoryService,
     @Inject(CACHE_MANAGER) private cacheManager: Cache,
+    @InjectRepository(SalesSchedulerSettingsEntity)
+    private readonly salesSchedulerRepo: Repository<SalesSchedulerSettingsEntity>,
+    @InjectRepository(InventorySchedulerSettingsEntity)
+    private readonly inventorySchedulerRepo: Repository<InventorySchedulerSettingsEntity>,
   ) {}
 
-  onModuleInit() {
-    this.logger.log('SyncService initialized — cron jobs registered.');
+  async onModuleInit(): Promise<void> {
+    this.logger.log('SyncService initialized — dynamic Sales and Inventory schedulers registered.');
+    await this.ensureSalesSchedulerSettings();
+    await this.ensureInventorySchedulerSettings();
+    await this.rescheduleSalesScheduler();
+    await this.rescheduleInventoryScheduler();
     // ── MANUAL TRIGGER ──────────────────────────────────────────────────
     // Uncomment any line below to force-run that report on next server start.
     // Re-comment after use.
@@ -171,17 +248,271 @@ export class SyncService implements OnModuleInit {
     // void this.executeForecastSync();
   }
 
+  // ── Sales Scheduler Settings ──────────────────────────────────────────────
+
+  private defaultSalesSchedulerSettings(): SalesSchedulerSettingsEntity {
+    return this.salesSchedulerRepo.create({
+      id: 'sales',
+      enabled: true,
+      dayOfWeek: DEFAULT_SALES_SCHEDULER_DAY,
+      timeOfDay: DEFAULT_SALES_SCHEDULER_TIME,
+      timezone: DEFAULT_SALES_SCHEDULER_TIMEZONE,
+      lastRunStatus: 'NEVER',
+      lastRunStartedAt: null,
+      lastRunFinishedAt: null,
+      lastRunError: null,
+      lastRunWeekRanges: null,
+    });
+  }
+
+  private async ensureSalesSchedulerSettings(): Promise<SalesSchedulerSettingsEntity> {
+    const existing = await this.salesSchedulerRepo.findOne({ where: { id: 'sales' } });
+    if (existing) return existing;
+    return this.salesSchedulerRepo.save(this.defaultSalesSchedulerSettings());
+  }
+
+  private toSalesSchedulerStatus(settings: SalesSchedulerSettingsEntity): SalesSchedulerStatus {
+    const nextRun = nextScheduledRunUtc(settings);
+    return {
+      enabled: settings.enabled,
+      dayOfWeek: settings.dayOfWeek,
+      dayLabel: WEEKDAY_LABELS[settings.dayOfWeek],
+      timeOfDay: settings.timeOfDay,
+      timezone: settings.timezone,
+      scheduleLabel: schedulerDisplayLabel(settings),
+      nextScheduledAt: nextRun?.toISOString() ?? null,
+      lastRunStartedAt: settings.lastRunStartedAt?.toISOString() ?? null,
+      lastRunFinishedAt: settings.lastRunFinishedAt?.toISOString() ?? null,
+      lastRunStatus: settings.lastRunStatus,
+      lastRunError: settings.lastRunError,
+      lastRunWeekRanges: settings.lastRunWeekRanges,
+      updatedAt: settings.updatedAt?.toISOString() ?? null,
+    };
+  }
+
+  async getSalesSchedulerStatus(): Promise<SalesSchedulerStatus> {
+    return this.toSalesSchedulerStatus(await this.ensureSalesSchedulerSettings());
+  }
+
+  async updateSalesSchedulerSettings(
+    dto: UpdateSalesSchedulerSettingsDto,
+  ): Promise<SalesSchedulerStatus> {
+    try {
+      normalizeSchedulerConfig({
+        enabled: dto.enabled ?? true,
+        dayOfWeek: dto.dayOfWeek,
+        timeOfDay: dto.timeOfDay,
+        timezone: dto.timezone,
+      });
+    } catch (error: any) {
+      throw new BadRequestException(error.message);
+    }
+
+    const current = await this.ensureSalesSchedulerSettings();
+    const saved = await this.salesSchedulerRepo.save({
+      ...current,
+      enabled: dto.enabled ?? current.enabled,
+      dayOfWeek: dto.dayOfWeek,
+      timeOfDay: dto.timeOfDay,
+      timezone: dto.timezone.trim(),
+    });
+
+    await this.rescheduleSalesScheduler(saved);
+    await this.updateSalesStatus({ nextScheduledAt: this.toSalesSchedulerStatus(saved).nextScheduledAt ?? '' });
+    return this.toSalesSchedulerStatus(saved);
+  }
+
+  private async getSalesNextScheduledAt(): Promise<string> {
+    const settings = await this.ensureSalesSchedulerSettings();
+    return nextScheduledRunUtc(settings)?.toISOString() ?? '';
+  }
+
+  private async patchSalesScheduler(
+    patch: Partial<SalesSchedulerSettingsEntity>,
+  ): Promise<SalesSchedulerSettingsEntity> {
+    const current = await this.ensureSalesSchedulerSettings();
+    return this.salesSchedulerRepo.save({ ...current, ...patch });
+  }
+
+  private async rescheduleSalesScheduler(settings?: SalesSchedulerSettingsEntity): Promise<void> {
+    if (this.salesScheduleTimer) {
+      clearTimeout(this.salesScheduleTimer);
+      this.salesScheduleTimer = null;
+    }
+
+    const schedulerSettings = settings ?? await this.ensureSalesSchedulerSettings();
+    if (!schedulerSettings.enabled) {
+      this.logger.log('[SalesScheduler] Disabled — no automatic Sales sync will be scheduled.');
+      return;
+    }
+
+    const nextRun = nextScheduledRunUtc(schedulerSettings);
+    if (!nextRun) {
+      this.logger.warn('[SalesScheduler] Could not calculate next run; scheduler not armed.');
+      return;
+    }
+
+    const delayMs = Math.max(nextRun.getTime() - Date.now(), 1_000);
+    this.salesScheduleTimer = setTimeout(() => {
+      void this.handleSalesScheduleTimer();
+    }, delayMs);
+    this.salesScheduleTimer.unref?.();
+
+    this.logger.log(`[SalesScheduler] Next run: ${nextRun.toISOString()} (${schedulerDisplayLabel(schedulerSettings)})`);
+  }
+
+  private async handleSalesScheduleTimer(): Promise<void> {
+    try {
+      await this.handleWeeklySalesSync();
+    } catch (error: any) {
+      this.logger.error('[SalesScheduler] Scheduled run finished with an error.', error.stack || error.message);
+    } finally {
+      await this.rescheduleSalesScheduler();
+    }
+  }
+
+  // ── Inventory Scheduler Settings ──────────────────────────────────────────
+
+  private defaultInventorySchedulerSettings(): InventorySchedulerSettingsEntity {
+    return this.inventorySchedulerRepo.create({
+      id: 'inventory',
+      enabled: true,
+      dayOfWeek: DEFAULT_INVENTORY_SCHEDULER_DAY,
+      timeOfDay: DEFAULT_INVENTORY_SCHEDULER_TIME,
+      timezone: DEFAULT_INVENTORY_SCHEDULER_TIMEZONE,
+      lastRunStatus: 'NEVER',
+      lastRunStartedAt: null,
+      lastRunFinishedAt: null,
+      lastRunError: null,
+      lastRunWeekRanges: null,
+    });
+  }
+
+  private async ensureInventorySchedulerSettings(): Promise<InventorySchedulerSettingsEntity> {
+    const existing = await this.inventorySchedulerRepo.findOne({ where: { id: 'inventory' } });
+    if (existing) return existing;
+    return this.inventorySchedulerRepo.save(this.defaultInventorySchedulerSettings());
+  }
+
+  private toInventorySchedulerStatus(settings: InventorySchedulerSettingsEntity): InventorySchedulerStatus {
+    const nextRun = nextScheduledRunUtc(settings);
+    return {
+      enabled: settings.enabled,
+      dayOfWeek: settings.dayOfWeek,
+      dayLabel: WEEKDAY_LABELS[settings.dayOfWeek],
+      timeOfDay: settings.timeOfDay,
+      timezone: settings.timezone,
+      scheduleLabel: schedulerDisplayLabel(settings),
+      nextScheduledAt: nextRun?.toISOString() ?? null,
+      lastRunStartedAt: settings.lastRunStartedAt?.toISOString() ?? null,
+      lastRunFinishedAt: settings.lastRunFinishedAt?.toISOString() ?? null,
+      lastRunStatus: settings.lastRunStatus,
+      lastRunError: settings.lastRunError,
+      lastRunWeekRanges: settings.lastRunWeekRanges,
+      updatedAt: settings.updatedAt?.toISOString() ?? null,
+    };
+  }
+
+  async getInventorySchedulerStatus(): Promise<InventorySchedulerStatus> {
+    return this.toInventorySchedulerStatus(await this.ensureInventorySchedulerSettings());
+  }
+
+  async updateInventorySchedulerSettings(
+    dto: UpdateInventorySchedulerSettingsDto,
+  ): Promise<InventorySchedulerStatus> {
+    try {
+      normalizeSchedulerConfig({
+        enabled: dto.enabled ?? true,
+        dayOfWeek: dto.dayOfWeek,
+        timeOfDay: dto.timeOfDay,
+        timezone: dto.timezone,
+      });
+    } catch (error: any) {
+      throw new BadRequestException(error.message);
+    }
+
+    const current = await this.ensureInventorySchedulerSettings();
+    const saved = await this.inventorySchedulerRepo.save({
+      ...current,
+      enabled: dto.enabled ?? current.enabled,
+      dayOfWeek: dto.dayOfWeek,
+      timeOfDay: dto.timeOfDay,
+      timezone: dto.timezone.trim(),
+    });
+
+    await this.rescheduleInventoryScheduler(saved);
+    await this.updateInventoryStatus({ nextScheduledAt: this.toInventorySchedulerStatus(saved).nextScheduledAt ?? '' });
+    return this.toInventorySchedulerStatus(saved);
+  }
+
+  private async getInventoryNextScheduledAt(): Promise<string> {
+    const settings = await this.ensureInventorySchedulerSettings();
+    return nextScheduledRunUtc(settings)?.toISOString() ?? '';
+  }
+
+  private async patchInventoryScheduler(
+    patch: Partial<InventorySchedulerSettingsEntity>,
+  ): Promise<InventorySchedulerSettingsEntity> {
+    const current = await this.ensureInventorySchedulerSettings();
+    return this.inventorySchedulerRepo.save({ ...current, ...patch });
+  }
+
+  private async rescheduleInventoryScheduler(settings?: InventorySchedulerSettingsEntity): Promise<void> {
+    if (this.inventoryScheduleTimer) {
+      clearTimeout(this.inventoryScheduleTimer);
+      this.inventoryScheduleTimer = null;
+    }
+
+    const schedulerSettings = settings ?? await this.ensureInventorySchedulerSettings();
+    if (!schedulerSettings.enabled) {
+      this.logger.log('[InventoryScheduler] Disabled — no automatic Inventory sync will be scheduled.');
+      return;
+    }
+
+    const nextRun = nextScheduledRunUtc(schedulerSettings);
+    if (!nextRun) {
+      this.logger.warn('[InventoryScheduler] Could not calculate next run; scheduler not armed.');
+      return;
+    }
+
+    const delayMs = Math.max(nextRun.getTime() - Date.now(), 1_000);
+    this.inventoryScheduleTimer = setTimeout(() => {
+      void this.handleInventoryScheduleTimer();
+    }, delayMs);
+    this.inventoryScheduleTimer.unref?.();
+
+    this.logger.log(`[InventoryScheduler] Next run: ${nextRun.toISOString()} (${schedulerDisplayLabel(schedulerSettings)})`);
+  }
+
+  private async handleInventoryScheduleTimer(): Promise<void> {
+    try {
+      await this.handleWeeklyInventorySync();
+    } catch (error: any) {
+      this.logger.error('[InventoryScheduler] Scheduled run finished with an error.', error.stack || error.message);
+    } finally {
+      await this.rescheduleInventoryScheduler();
+    }
+  }
+
   // ── Public Status Getters ──────────────────────────────────────────────────
 
   // Public getters apply the error-expiry view so all clients (dashboard poll,
   // /sync/health) agree. Internal updaters read the raw stored status instead.
 
   async getSalesStatus(): Promise<ReportSyncStatus> {
-    return applyErrorExpiry(await this.getRawSalesStatus());
+    const status = await this.getRawSalesStatus();
+    return applyErrorExpiry({
+      ...status,
+      nextScheduledAt: await this.getSalesNextScheduledAt(),
+    });
   }
 
   async getInventoryStatus(): Promise<ReportSyncStatus> {
-    return applyErrorExpiry(await this.getRawInventoryStatus());
+    const status = await this.getRawInventoryStatus();
+    return applyErrorExpiry({
+      ...status,
+      nextScheduledAt: await this.getInventoryNextScheduledAt(),
+    });
   }
 
   async getForecastStatus(): Promise<ReportSyncStatus> {
@@ -215,40 +546,78 @@ export class SyncService implements OnModuleInit {
   // ── Scheduled Cron Jobs ────────────────────────────────────────────────────
 
   /**
-   * Sales report sync — every Wednesday at midnight Pacific
-   * Cron: '0 0 * * 3'
-   *
-   * Uses getLastCompletedWeek(3) — the last Mon→Sun week where
-   * Sunday is at least 3 days in the past, giving Amazon time to finalize
-   * the data. This matches what Vendor Central portal shows.
+   * Sales report sync — default Wednesday 10:00 PM America/New_York.
+   * The dynamic timer is configured from persisted settings; each scheduled run
+   * reconciles the last three completed Amazon Sunday→Saturday weeks.
    */
-  // @Cron('0 0 * * 3')
   async handleWeeklySalesSync(): Promise<void> {
-    this.logger.log('[CRON] Weekly Sales Sync triggered (Wednesday)');
-    const { startDate, endDate } = getLastCompletedWeek(3);
-    this.logger.log(`[CRON] Sales sync window (lag=3d): ${startDate} → ${endDate}`);
+    const weeks = getPreviousCompletedAmazonWeeks(3);
+    this.logger.log(
+      `[SalesScheduler] Triggered. Weeks: ${weeks.map(w => `${w.label} ${w.startDate}→${w.endDate}`).join(', ')}`,
+    );
+
+    await this.patchSalesScheduler({
+      lastRunStatus: 'RUNNING',
+      lastRunStartedAt: new Date(),
+      lastRunFinishedAt: null,
+      lastRunError: null,
+      lastRunWeekRanges: weeks,
+    });
+
     try {
-      await this.executeSalesSync(startDate, endDate, 'cron');
-    } catch {
-      // already logged inside executeSalesSync
+      await this.executeScheduledSalesWeeksSync(weeks);
+      await this.patchSalesScheduler({
+        lastRunStatus: 'SUCCESS',
+        lastRunFinishedAt: new Date(),
+        lastRunError: null,
+        lastRunWeekRanges: weeks,
+      });
+    } catch (error: any) {
+      await this.patchSalesScheduler({
+        lastRunStatus: 'FAILED',
+        lastRunFinishedAt: new Date(),
+        lastRunError: maskSecret(error?.message || 'Unknown scheduler error'),
+        lastRunWeekRanges: weeks,
+      });
+      throw error;
     }
   }
 
   /**
-   * Inventory report sync — every Sunday at midnight Pacific
-   * Cron: '0 0 * * 0'
-   *
-   * Uses getLastCompletedWeek(3) — same lag-buffer logic as sales.
+   * Inventory report sync — default Sunday 10:00 PM America/New_York.
+   * The dynamic timer is configured from persisted settings; each scheduled run
+   * reconciles the last three completed Amazon Sunday→Saturday weeks.
    */
-  // @Cron('0 0 * * 0')
   async handleWeeklyInventorySync(): Promise<void> {
-    this.logger.log('[CRON] Weekly Inventory Sync triggered (Sunday)');
-    const { startDate, endDate } = getLastCompletedWeek(3);
-    this.logger.log(`[CRON] Inventory sync window (lag=3d): ${startDate} → ${endDate}`);
+    const weeks = getPreviousCompletedAmazonWeeks(3);
+    this.logger.log(
+      `[InventoryScheduler] Triggered. Weeks: ${weeks.map(w => `${w.label} ${w.startDate}→${w.endDate}`).join(', ')}`,
+    );
+
+    await this.patchInventoryScheduler({
+      lastRunStatus: 'RUNNING',
+      lastRunStartedAt: new Date(),
+      lastRunFinishedAt: null,
+      lastRunError: null,
+      lastRunWeekRanges: weeks,
+    });
+
     try {
-      await this.executeInventorySync(startDate, endDate, 'cron');
-    } catch {
-      // already logged inside executeInventorySync
+      await this.executeScheduledInventoryWeeksSync(weeks);
+      await this.patchInventoryScheduler({
+        lastRunStatus: 'SUCCESS',
+        lastRunFinishedAt: new Date(),
+        lastRunError: null,
+        lastRunWeekRanges: weeks,
+      });
+    } catch (error: any) {
+      await this.patchInventoryScheduler({
+        lastRunStatus: 'FAILED',
+        lastRunFinishedAt: new Date(),
+        lastRunError: maskSecret(error?.message || 'Unknown scheduler error'),
+        lastRunWeekRanges: weeks,
+      });
+      throw error;
     }
   }
 
@@ -292,7 +661,8 @@ export class SyncService implements OnModuleInit {
       lastSyncStatus: 'IN_PROGRESS',
       lastError: null,
       lastSyncPeriod: { startDate, endDate },
-      nextScheduledAt: nextWeekday(3),
+      lastSyncPeriods: null,
+      nextScheduledAt: await this.getSalesNextScheduledAt(),
       stageTimestamps: { [SyncStage.REQUESTING_REPORT]: new Date().toISOString() },
     });
 
@@ -317,7 +687,7 @@ export class SyncService implements OnModuleInit {
         currentStage: SyncStage.COMPLETED,
         lastSyncFinishedAt: new Date().toISOString(),
         lastSyncStatus: 'SUCCESS',
-        nextScheduledAt: nextWeekday(3),
+        nextScheduledAt: await this.getSalesNextScheduledAt(),
       });
     } catch (error: any) {
       if (error instanceof SyncCancelledError) {
@@ -328,7 +698,7 @@ export class SyncService implements OnModuleInit {
           lastSyncFinishedAt: new Date().toISOString(),
           lastSyncStatus: 'IDLE',
           lastError: 'Sync cancelled by user.',
-          nextScheduledAt: nextWeekday(3),
+          nextScheduledAt: await this.getSalesNextScheduledAt(),
         });
         return; // cancellation is not a failure — swallow
       }
@@ -339,12 +709,212 @@ export class SyncService implements OnModuleInit {
         lastSyncFinishedAt: new Date().toISOString(),
         lastSyncStatus: 'FAILED',
         lastError: maskSecret(error?.message || 'Unknown error'),
-        nextScheduledAt: nextWeekday(3),
+        nextScheduledAt: await this.getSalesNextScheduledAt(),
       });
       throw error;
     } finally {
       await this.cacheManager.del(KEYS.SALES_LOCK);
       await this.cacheManager.del(KEYS.SALES_CANCEL);
+    }
+  }
+
+  private async executeScheduledSalesWeeksSync(weeks: AmazonWeekRange[]): Promise<void> {
+    if (!weeks.length) throw new BadRequestException('At least one Amazon week is required.');
+
+    const chronologicalWeeks = [...weeks].reverse();
+    const combinedPeriod = {
+      startDate: chronologicalWeeks[0].startDate,
+      endDate: chronologicalWeeks[chronologicalWeeks.length - 1].endDate,
+    };
+
+    const isLocked = await this.cacheManager.get(KEYS.SALES_LOCK);
+    if (isLocked) {
+      this.logger.warn('[SalesScheduler] Sales sync already in progress — scheduled run skipped.');
+      throw new ConflictException('Sales sync is already active.');
+    }
+
+    await this.cacheManager.set(KEYS.SALES_LOCK, 'true', ONE_HOUR_MS * 8);
+    await this.cacheManager.del(KEYS.SALES_CANCEL);
+
+    await this.updateSalesStatus({
+      isSyncing: true,
+      currentStage: SyncStage.REQUESTING_REPORT,
+      lastSyncStartedAt: new Date().toISOString(),
+      lastSyncStatus: 'IN_PROGRESS',
+      lastError: null,
+      lastSyncPeriod: combinedPeriod,
+      lastSyncPeriods: weeks,
+      nextScheduledAt: await this.getSalesNextScheduledAt(),
+      stageTimestamps: { [SyncStage.REQUESTING_REPORT]: new Date().toISOString() },
+    });
+
+    const t0 = Date.now();
+    this.logger.log(`[SalesScheduler] Starting 3-week Sales sync — ${combinedPeriod.startDate} → ${combinedPeriod.endDate}`);
+
+    try {
+      for (const week of chronologicalWeeks) {
+        if (await this.cacheManager.get(KEYS.SALES_CANCEL)) throw new SyncCancelledError();
+
+        await this.updateSalesStatus({
+          currentStage: SyncStage.REQUESTING_REPORT,
+          lastSyncPeriod: { startDate: week.startDate, endDate: week.endDate },
+          stageTimestamps: { [SyncStage.REQUESTING_REPORT]: new Date().toISOString() },
+        });
+
+        this.logger.log(`[SalesScheduler] Syncing ${week.label}: ${week.startDate} → ${week.endDate}`);
+        await this.salesService.syncDailySales(
+          week.startDate,
+          week.endDate,
+          async (stage) => await this.updateSalesStage(stage as SyncStage),
+          async () => {
+            if (await this.cacheManager.get(KEYS.SALES_CANCEL)) throw new SyncCancelledError();
+          },
+        );
+      }
+
+      const durationMs = Date.now() - t0;
+      this.logger.log(`[SalesScheduler] 3-week Sales sync complete in ${durationMs}ms`);
+
+      await this.updateSalesStatus({
+        isSyncing: false,
+        currentStage: SyncStage.COMPLETED,
+        lastSyncFinishedAt: new Date().toISOString(),
+        lastSyncStatus: 'SUCCESS',
+        lastSyncPeriod: combinedPeriod,
+        lastSyncPeriods: weeks,
+        nextScheduledAt: await this.getSalesNextScheduledAt(),
+      });
+    } catch (error: any) {
+      if (error instanceof SyncCancelledError) {
+        this.logger.warn('[SalesScheduler] Sales sync cancelled by user.');
+        await this.updateSalesStatus({
+          isSyncing: false,
+          currentStage: SyncStage.IDLE,
+          lastSyncFinishedAt: new Date().toISOString(),
+          lastSyncStatus: 'IDLE',
+          lastError: 'Sync cancelled by user.',
+          lastSyncPeriod: combinedPeriod,
+          lastSyncPeriods: weeks,
+          nextScheduledAt: await this.getSalesNextScheduledAt(),
+        });
+        throw error;
+      }
+
+      this.logger.error('[SalesScheduler] Sales sync failed', error.stack || error.message);
+      await this.updateSalesStatus({
+        isSyncing: false,
+        currentStage: SyncStage.FAILED,
+        lastSyncFinishedAt: new Date().toISOString(),
+        lastSyncStatus: 'FAILED',
+        lastError: maskSecret(error?.message || 'Unknown error'),
+        lastSyncPeriod: combinedPeriod,
+        lastSyncPeriods: weeks,
+        nextScheduledAt: await this.getSalesNextScheduledAt(),
+      });
+      throw error;
+    } finally {
+      await this.cacheManager.del(KEYS.SALES_LOCK);
+      await this.cacheManager.del(KEYS.SALES_CANCEL);
+    }
+  }
+
+  private async executeScheduledInventoryWeeksSync(weeks: AmazonWeekRange[]): Promise<void> {
+    if (!weeks.length) throw new BadRequestException('At least one Amazon week is required.');
+
+    const chronologicalWeeks = [...weeks].reverse();
+    const combinedPeriod = {
+      startDate: chronologicalWeeks[0].startDate,
+      endDate: chronologicalWeeks[chronologicalWeeks.length - 1].endDate,
+    };
+
+    const isLocked = await this.cacheManager.get(KEYS.INVENTORY_LOCK);
+    if (isLocked) {
+      this.logger.warn('[InventoryScheduler] Inventory sync already in progress — scheduled run skipped.');
+      throw new ConflictException('Inventory sync is already active.');
+    }
+
+    await this.cacheManager.set(KEYS.INVENTORY_LOCK, 'true', ONE_HOUR_MS * 8);
+    await this.cacheManager.del(KEYS.INVENTORY_CANCEL);
+
+    await this.updateInventoryStatus({
+      isSyncing: true,
+      currentStage: SyncStage.REQUESTING_REPORT,
+      lastSyncStartedAt: new Date().toISOString(),
+      lastSyncStatus: 'IN_PROGRESS',
+      lastError: null,
+      lastSyncPeriod: combinedPeriod,
+      lastSyncPeriods: weeks,
+      nextScheduledAt: await this.getInventoryNextScheduledAt(),
+      stageTimestamps: { [SyncStage.REQUESTING_REPORT]: new Date().toISOString() },
+    });
+
+    const t0 = Date.now();
+    this.logger.log(`[InventoryScheduler] Starting 3-week Inventory sync — ${combinedPeriod.startDate} → ${combinedPeriod.endDate}`);
+
+    try {
+      for (const week of chronologicalWeeks) {
+        if (await this.cacheManager.get(KEYS.INVENTORY_CANCEL)) throw new SyncCancelledError();
+
+        await this.updateInventoryStatus({
+          currentStage: SyncStage.REQUESTING_REPORT,
+          lastSyncPeriod: { startDate: week.startDate, endDate: week.endDate },
+          stageTimestamps: { [SyncStage.REQUESTING_REPORT]: new Date().toISOString() },
+        });
+
+        this.logger.log(`[InventoryScheduler] Syncing ${week.label}: ${week.startDate} → ${week.endDate}`);
+        await this.inventoryService.syncDailyInventory(
+          week.startDate,
+          week.endDate,
+          async (stage) => await this.updateInventoryStage(stage as SyncStage),
+          async () => {
+            if (await this.cacheManager.get(KEYS.INVENTORY_CANCEL)) throw new SyncCancelledError();
+          },
+        );
+      }
+
+      const durationMs = Date.now() - t0;
+      this.logger.log(`[InventoryScheduler] 3-week Inventory sync complete in ${durationMs}ms`);
+
+      await this.updateInventoryStatus({
+        isSyncing: false,
+        currentStage: SyncStage.COMPLETED,
+        lastSyncFinishedAt: new Date().toISOString(),
+        lastSyncStatus: 'SUCCESS',
+        lastSyncPeriod: combinedPeriod,
+        lastSyncPeriods: weeks,
+        nextScheduledAt: await this.getInventoryNextScheduledAt(),
+      });
+    } catch (error: any) {
+      if (error instanceof SyncCancelledError) {
+        this.logger.warn('[InventoryScheduler] Inventory sync cancelled by user.');
+        await this.updateInventoryStatus({
+          isSyncing: false,
+          currentStage: SyncStage.IDLE,
+          lastSyncFinishedAt: new Date().toISOString(),
+          lastSyncStatus: 'IDLE',
+          lastError: 'Sync cancelled by user.',
+          lastSyncPeriod: combinedPeriod,
+          lastSyncPeriods: weeks,
+          nextScheduledAt: await this.getInventoryNextScheduledAt(),
+        });
+        throw error;
+      }
+
+      this.logger.error('[InventoryScheduler] Inventory sync failed', error.stack || error.message);
+      await this.updateInventoryStatus({
+        isSyncing: false,
+        currentStage: SyncStage.FAILED,
+        lastSyncFinishedAt: new Date().toISOString(),
+        lastSyncStatus: 'FAILED',
+        lastError: maskSecret(error?.message || 'Unknown error'),
+        lastSyncPeriod: combinedPeriod,
+        lastSyncPeriods: weeks,
+        nextScheduledAt: await this.getInventoryNextScheduledAt(),
+      });
+      throw error;
+    } finally {
+      await this.cacheManager.del(KEYS.INVENTORY_LOCK);
+      await this.cacheManager.del(KEYS.INVENTORY_CANCEL);
     }
   }
 
@@ -373,7 +943,8 @@ export class SyncService implements OnModuleInit {
       lastSyncStatus: 'IN_PROGRESS',
       lastError: null,
       lastSyncPeriod: { startDate, endDate },
-      nextScheduledAt: nextWeekday(0),
+      lastSyncPeriods: null,
+      nextScheduledAt: await this.getInventoryNextScheduledAt(),
       stageTimestamps: { [SyncStage.REQUESTING_REPORT]: new Date().toISOString() },
     });
 
@@ -398,7 +969,7 @@ export class SyncService implements OnModuleInit {
         currentStage: SyncStage.COMPLETED,
         lastSyncFinishedAt: new Date().toISOString(),
         lastSyncStatus: 'SUCCESS',
-        nextScheduledAt: nextWeekday(0),
+        nextScheduledAt: await this.getInventoryNextScheduledAt(),
       });
     } catch (error: any) {
       if (error instanceof SyncCancelledError) {
@@ -409,7 +980,7 @@ export class SyncService implements OnModuleInit {
           lastSyncFinishedAt: new Date().toISOString(),
           lastSyncStatus: 'IDLE',
           lastError: 'Sync cancelled by user.',
-          nextScheduledAt: nextWeekday(0),
+          nextScheduledAt: await this.getInventoryNextScheduledAt(),
         });
         return; // cancellation is not a failure — swallow
       }
@@ -420,7 +991,7 @@ export class SyncService implements OnModuleInit {
         lastSyncFinishedAt: new Date().toISOString(),
         lastSyncStatus: 'FAILED',
         lastError: maskSecret(error?.message || 'Unknown error'),
-        nextScheduledAt: nextWeekday(0),
+        nextScheduledAt: await this.getInventoryNextScheduledAt(),
       });
       throw error;
     } finally {

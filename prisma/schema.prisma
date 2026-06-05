@@ -1,0 +1,79 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model AmazonSalesAggregate {
+  startDate              String  @id(map: "amazon_sales_aggregate_pkey") @map("start_date") @db.VarChar
+  endDate                String  @map("end_date") @db.VarChar
+  customerReturns        Int     @default(0) @map("customer_returns")
+  orderedRevenueAmount   Decimal @default(0.00) @map("ordered_revenue_amount") @db.Decimal(10, 2)
+  orderedRevenueCurrency String  @default("USD") @map("ordered_revenue_currency") @db.VarChar
+  orderedUnits           Int     @default(0) @map("ordered_units")
+  shippedCogsAmount      Decimal @default(0.00) @map("shipped_cogs_amount") @db.Decimal(10, 2)
+  shippedCogsCurrency    String  @default("USD") @map("shipped_cogs_currency") @db.VarChar
+  shippedRevenueAmount   Decimal @default(0.00) @map("shipped_revenue_amount") @db.Decimal(10, 2)
+  shippedRevenueCurrency String  @default("USD") @map("shipped_revenue_currency") @db.VarChar
+  shippedUnits           Int     @default(0) @map("shipped_units")
+
+  @@unique([startDate, endDate])
+  @@map("amazon_sales_aggregate")
+}
+
+model AmazonSalesByAsin {
+  startDate           String  @map("start_date") @db.VarChar
+  endDate             String  @map("end_date") @db.VarChar
+  asin                String  @db.VarChar
+  customerReturns     Int     @default(0) @map("customer_returns")
+  shippedCogsAmount   Decimal @default(0.00) @map("shipped_cogs_amount") @db.Decimal(10, 2)
+  shippedCogsCurrency String  @default("USD") @map("shipped_cogs_currency") @db.VarChar
+  shippedRevenueAmount   Decimal @default(0.00) @map("shipped_revenue_amount") @db.Decimal(10, 2)
+  shippedRevenueCurrency String  @default("USD") @map("shipped_revenue_currency") @db.VarChar
+  shippedUnits        Int     @default(0) @map("shipped_units")
+
+  @@id([startDate, endDate, asin])
+  @@map("amazon_sales_by_asin")
+}
+
+model AmazonInventoryByAsin {
+  startDate                    DateTime @map("start_date") @db.Date
+  endDate                      DateTime @map("end_date") @db.Date
+  asin                         String   @db.VarChar
+  averageVendorLeadTimeDays    Decimal? @map("average_vendor_lead_time_days") @db.Decimal(10, 2)
+  netReceivedInventoryUnits    Int?     @map("net_received_inventory_units")
+  openPurchaseOrderUnits       Int?     @map("open_purchase_order_units")
+  sellableOnHandInventoryUnits Int?     @map("sellable_on_hand_inventory_units")
+  sellThroughRate              Decimal? @map("sell_through_rate") @db.Decimal(10, 4)
+  unfilledCustomerOrderedUnits Int?     @map("unfilled_customer_ordered_units")
+  unsellableOnHandInventoryUnits Int?   @map("unsellable_on_hand_inventory_units")
+
+  @@id([startDate, endDate, asin])
+  @@map("amazon_inventory_by_asin")
+}
+
+model AmazonForecastByAsin {
+  forecastGenerationDate DateTime @map("forecast_generation_date") @db.Date
+  asin                   String   @db.VarChar
+  forecastMeanUnits      Int?     @map("forecast_mean_units")
+  forecastP70Units       Int?     @map("forecast_p70_units")
+  forecastP80Units       Int?     @map("forecast_p80_units")
+  forecastP90Units       Int?     @map("forecast_p90_units")
+
+  @@id([forecastGenerationDate, asin])
+  @@map("amazon_forecast_by_asin")
+}
+
+model ReportStatus {
+  id          Int       @id @default(autoincrement())
+  reportType  String    @map("report_type") @db.VarChar
+  status      String    @db.VarChar
+  error       String?   @db.Text
+  retryCount  Int       @default(0) @map("retry_count")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  @@map("report_status")
+}

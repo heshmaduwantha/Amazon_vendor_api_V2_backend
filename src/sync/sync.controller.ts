@@ -1,8 +1,10 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Post } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, HttpStatus, Post, Put } from '@nestjs/common';
 import { SyncService } from './sync.service';
 import { AmazonApiService } from '../amazon-api/amazon-api.service';
 import { ManualSyncDto } from './dto/manual-sync.dto';
 import { getLastSevenDays } from '../utils/date.util';
+import { UpdateInventorySchedulerSettingsDto } from './dto/update-inventory-scheduler-settings.dto';
+import { UpdateSalesSchedulerSettingsDto } from './dto/update-sales-scheduler-settings.dto';
 
 @Controller('sync')
 export class SyncController {
@@ -17,6 +19,26 @@ export class SyncController {
   @Get('status')
   async getCombinedStatus() {
     return this.syncService.getCombinedStatus();
+  }
+
+  @Get('scheduler/sales')
+  async getSalesSchedulerStatus() {
+    return this.syncService.getSalesSchedulerStatus();
+  }
+
+  @Put('scheduler/sales')
+  async updateSalesSchedulerSettings(@Body() body: UpdateSalesSchedulerSettingsDto) {
+    return this.syncService.updateSalesSchedulerSettings(body);
+  }
+
+  @Get('scheduler/inventory')
+  async getInventorySchedulerStatus() {
+    return this.syncService.getInventorySchedulerStatus();
+  }
+
+  @Put('scheduler/inventory')
+  async updateInventorySchedulerSettings(@Body() body: UpdateInventorySchedulerSettingsDto) {
+    return this.syncService.updateInventorySchedulerSettings(body);
   }
 
   @Get('status/sales')
@@ -46,10 +68,12 @@ export class SyncController {
    */
   @Get('health')
   async getSystemHealth() {
-    const [combined, quotaStatus, rateLimitConfig] = await Promise.all([
+    const [combined, quotaStatus, rateLimitConfig, salesScheduler, inventoryScheduler] = await Promise.all([
       this.syncService.getCombinedStatus(),
       this.amazonApiService.getAllQuotaStatus(),
       Promise.resolve(this.amazonApiService.getRateLimitConfig()),
+      this.syncService.getSalesSchedulerStatus(),
+      this.syncService.getInventorySchedulerStatus(),
     ]);
 
     // Build a human-friendly quota summary
@@ -86,6 +110,8 @@ export class SyncController {
       },
       quotaGroups:  quotaSummary,
       syncStatus:   combined,
+      salesScheduler,
+      inventoryScheduler,
     };
   }
 
