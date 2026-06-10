@@ -21,8 +21,8 @@ async function bootstrap() {
     }),
   );
 
-  const port = process.env.PORT ?? 3000;
-  await app.listen(port);
+  const port = process.env.PORT ?? 4018;
+  await app.listen(4018);
   console.log(`\n🚀 Backend running on http://localhost:${port}\n`);
 }
 bootstrap();

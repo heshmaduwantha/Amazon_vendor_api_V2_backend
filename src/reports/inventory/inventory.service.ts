@@ -429,27 +429,58 @@ export class InventoryService {
    * Returns all inventory records in the given date range plus an aggregated
    * summary.  Used by the Data Tally panel to compare against Vendor Central.
    */
+  // async queryInventorySnapshot(
+  //   startDate: string,
+  //   endDate: string,
+  // ): Promise<InventorySnapshotResult> {
+  //   const records = await this.inventoryRepo
+  //     .createQueryBuilder('i')
+  //     .where('i.startDate >= :startDate', { startDate })
+  //     .andWhere('i.endDate <= :endDate',   { endDate })
+  //     .orderBy('i.startDate', 'ASC')
+  //     .addOrderBy('i.asin', 'ASC')
+  //     .getMany();
+  //
+  //   const asinSet = new Set(records.map(r => r.asin));
+  //   const summary: InventorySnapshotSummary = {
+  //     totalAsins:           asinSet.size,
+  //     totalSellableUnits:   records.reduce((s, r) => s + (r.sellableOnHandInventoryUnits   || 0), 0),
+  //     totalUnsellableUnits: records.reduce((s, r) => s + (r.unsellableOnHandInventoryUnits || 0), 0),
+  //     avgOosRatePct: records.length > 0
+  //       ? (records.reduce((s, r) => s + (r.sourceableProductOutOfStockRate || 0), 0) / records.length) * 100
+  //       : 0,
+  //     totalOpenPoUnits: records.reduce((s, r) => s + (r.openPurchaseOrderUnits || 0), 0),
+  //   };
+  //
+  //   return { period: { startDate, endDate }, records, summary, rowCount: records.length };
+  // }
+
+
   async queryInventorySnapshot(
-    startDate: string,
-    endDate: string,
+      startDate: string,
+      endDate: string,
   ): Promise<InventorySnapshotResult> {
     const records = await this.inventoryRepo
-      .createQueryBuilder('i')
-      .where('i.startDate >= :startDate', { startDate })
-      .andWhere('i.endDate <= :endDate',   { endDate })
-      .orderBy('i.startDate', 'ASC')
-      .addOrderBy('i.asin', 'ASC')
-      .getMany();
+        .createQueryBuilder('i')
+        .where('i.startDate >= :startDate', { startDate })
+        .andWhere('i.endDate <= :endDate',   { endDate })
+        .orderBy('i.startDate', 'ASC')
+        .addOrderBy('i.asin', 'ASC')
+        .getMany();
 
-    const asinSet = new Set(records.map(r => r.asin));
+    // For snapshot metrics (on-hand units, OOS rate, open PO), use only the
+    // last date in the range — summing across all days would overcount inventory.
+    const lastDateRecords = records.filter(r => r.startDate === endDate);
+    const snapshotRecords = lastDateRecords.length > 0 ? lastDateRecords : records;
+    const asinSet = new Set(snapshotRecords.map(r => r.asin));
     const summary: InventorySnapshotSummary = {
       totalAsins:           asinSet.size,
-      totalSellableUnits:   records.reduce((s, r) => s + (r.sellableOnHandInventoryUnits   || 0), 0),
-      totalUnsellableUnits: records.reduce((s, r) => s + (r.unsellableOnHandInventoryUnits || 0), 0),
-      avgOosRatePct: records.length > 0
-        ? (records.reduce((s, r) => s + (r.sourceableProductOutOfStockRate || 0), 0) / records.length) * 100
-        : 0,
-      totalOpenPoUnits: records.reduce((s, r) => s + (r.openPurchaseOrderUnits || 0), 0),
+      totalSellableUnits:   snapshotRecords.reduce((s, r) => s + (r.sellableOnHandInventoryUnits   || 0), 0),
+      totalUnsellableUnits: snapshotRecords.reduce((s, r) => s + (r.unsellableOnHandInventoryUnits || 0), 0),
+      avgOosRatePct: snapshotRecords.length > 0
+          ? (snapshotRecords.reduce((s, r) => s + (r.sourceableProductOutOfStockRate || 0), 0) / snapshotRecords.length) * 100
+          : 0,
+      totalOpenPoUnits: snapshotRecords.reduce((s, r) => s + (r.openPurchaseOrderUnits || 0), 0),
     };
 
     return { period: { startDate, endDate }, records, summary, rowCount: records.length };
