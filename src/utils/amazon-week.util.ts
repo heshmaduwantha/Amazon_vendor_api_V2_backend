@@ -33,10 +33,9 @@ function formatDate(date: Date): string {
   return date.toISOString().slice(0, 10);
 }
 
-function firstSundayOnOrAfterJanOne(year: number): Date {
+function firstSundayOnOrBeforeJanOne(year: number): Date {
   const janOne = new Date(Date.UTC(year, 0, 1));
-  const daysUntilSunday = (7 - janOne.getUTCDay()) % 7;
-  return addUtcDays(janOne, daysUntilSunday);
+  return addUtcDays(janOne, -janOne.getUTCDay());
 }
 
 function sundayOnOrBefore(date: Date): Date {
@@ -45,13 +44,10 @@ function sundayOnOrBefore(date: Date): Date {
 
 export function getAmazonWeekInfo(input: string | Date): AmazonWeekInfo {
   const date = toUtcDateOnly(input);
-  let amazonYear = date.getUTCFullYear();
-  let amazonYearStart = firstSundayOnOrAfterJanOne(amazonYear);
-
-  if (date < amazonYearStart) {
-    amazonYear -= 1;
-    amazonYearStart = firstSundayOnOrAfterJanOne(amazonYear);
-  }
+  const calendarYear = date.getUTCFullYear();
+  const nextAmazonYearStart = firstSundayOnOrBeforeJanOne(calendarYear + 1);
+  const amazonYear = date >= nextAmazonYearStart ? calendarYear + 1 : calendarYear;
+  const amazonYearStart = firstSundayOnOrBeforeJanOne(amazonYear);
 
   const weekStart = sundayOnOrBefore(date);
   const weekEnd = addUtcDays(weekStart, 6);
