@@ -35,6 +35,20 @@ export interface QuotaStatus {
 
 const gunzip = promisify(zlib.gunzip);
 
+export class RateLimitError extends Error {
+  readonly statusCode = 429;
+  readonly retryAfter: number | null;
+
+  constructor(endpoint: string, retryAfter: number | null = null) {
+    const hint = retryAfter
+      ? ` Amazon says retry after ${retryAfter}s.`
+      : ' Wait for Amazon SP-API quota to refill before retrying.';
+    super(`Amazon SP-API rate limit (429) hit on ${endpoint}.${hint}`);
+    this.name = 'RateLimitError';
+    this.retryAfter = retryAfter;
+  }
+}
+
 @Injectable()
 export class AmazonApiService {
   private readonly logger = new Logger(AmazonApiService.name);
