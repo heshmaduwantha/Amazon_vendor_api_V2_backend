@@ -135,6 +135,29 @@ describe('InventoryService', () => {
     expect(queryBuilder.execute).toHaveBeenCalledTimes(1);
   });
 
+  it('formats reconciliation dates without timezone conversion', async () => {
+    const reconciliationBuilder = {
+      select: jest.fn().mockReturnThis(),
+      addSelect: jest.fn().mockReturnThis(),
+      where: jest.fn().mockReturnThis(),
+      andWhere: jest.fn().mockReturnThis(),
+      groupBy: jest.fn().mockReturnThis(),
+      orderBy: jest.fn().mockReturnThis(),
+      getRawMany: jest.fn().mockResolvedValue([
+        { date: '2025-09-16', recordCount: '632' },
+      ]),
+    };
+    repository.createQueryBuilder.mockReturnValueOnce(reconciliationBuilder);
+
+    await expect(
+      service.getInventoryCountsByDate('2025-09-16', '2025-09-30'),
+    ).resolves.toEqual([{ date: '2025-09-16', recordCount: 632 }]);
+    expect(reconciliationBuilder.select).toHaveBeenCalledWith(
+      "TO_CHAR(inventory.startDate, 'YYYY-MM-DD')",
+      'date',
+    );
+  });
+
   it('splits DAY inventory report ranges into Amazon-safe 15-day chunks', () => {
     expect((service as any).getInventoryReportRanges('2026-04-01', '2026-04-30', 'DAY')).toEqual([
       { startDate: '2026-04-01', endDate: '2026-04-15' },

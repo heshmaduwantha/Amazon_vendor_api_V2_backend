@@ -481,7 +481,7 @@ export class InventoryService {
   async getInventoryCountsByDate(startDate: string, endDate: string): Promise<InventoryDateCount[]> {
     const rows = await this.inventoryRepo
       .createQueryBuilder('inventory')
-      .select('inventory.startDate', 'date')
+      .select("TO_CHAR(inventory.startDate, 'YYYY-MM-DD')", 'date')
       .addSelect('COUNT(*)', 'recordCount')
       .where('inventory.startDate >= :startDate', { startDate })
       .andWhere('inventory.startDate <= :endDate', { endDate })
