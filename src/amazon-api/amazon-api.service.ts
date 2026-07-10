@@ -88,19 +88,51 @@ export class AmazonApiService {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  private signRequest(
-    method: string,
-    url: URL,
-    accessToken: string,
-    data?: any,
-  ): AxiosRequestConfig {
+  private getTimeoutMs(): number {
+    const seconds = Number(this.configService.get<string>('AMAZON_API_TIMEOUT_SECONDS') || '60');
+    return Number.isFinite(seconds) && seconds > 0 ? Math.floor(seconds * 1000) : 60_000;
+  }
+
+  private getMaxRetries(isReportDocumentEndpoint = false): number {
+    const configured = this.configService.get<string>('AMAZON_API_MAX_RETRIES');
+    const fallback = isReportDocumentEndpoint ? 8 : 5;
+    const retries = configured === undefined ? fallback : Number(configured);
+    return Number.isInteger(retries) && retries >= 0 ? Math.min(retries, 20) : fallback;
+  }
+
+  private isTransientFailure(error: any): boolean {
+    const status = error?.response?.status;
+    if ([429, 500, 502, 503, 504].includes(status)) return true;
+    return !status && ['ECONNRESET', 'ETIMEDOUT', 'ECONNABORTED', 'EPIPE'].includes(error?.code);
+  }
+
+  private getRequestId(error: any): string | null {
+    const headers = error?.response?.headers;
+    return headers?.['x-amzn-requestid'] ?? headers?.['x-amz-request-id'] ?? null;
+  }
+
+  private safeErrorDetails(error: any): string {
+    const responseError = error?.response?.data?.errors?.[0];
+    const details = {
+      code: responseError?.code ?? error?.code ?? null,
+      message: error?.message ?? 'Amazon request failed',
+      requestId: this.getRequestId(error),
+    };
+    return maskSecret(JSON.stringify(details)).slice(0, 1000);
+  }
+
+  private exponentialBackoffMs(attempt: number): number {
+    return 1000 * Math.pow(2, attempt) + Math.floor(Math.random() * 500);
+  }
+
+  private signRequest(method: string, url: URL, accessToken: string, data?: any): AxiosRequestConfig {
     const useSigV4 = this.configService.get<string>('USE_SIGV4') !== 'false';
     const credentials = this.authService.getAwsCredentials();
 
     const headers: Record<string, string> = {
       'x-amz-access-token': accessToken,
       'Content-Type': 'application/json',
-      'Accept': 'application/json',
+      Accept: 'application/json',
     };
 
     if (!useSigV4) {
@@ -110,6 +142,7 @@ export class AmazonApiService {
         url: url.toString(),
         headers,
         data,
+        timeout: this.getTimeoutMs(),
       };
     }
 
@@ -140,6 +173,7 @@ export class AmazonApiService {
       url: `https://${signOptions.host}${signOptions.path}`,
       headers: signOptions.headers as any,
       data: data,
+      timeout: this.getTimeoutMs(),
     };
   }
 
@@ -147,7 +181,7 @@ export class AmazonApiService {
     const group = this.getQuotaGroup(endpoint);
     const key = `${this.QUOTA_BASE_KEY}${group}`;
     const now = new Date();
-    
+
     const currentRaw = await this.cacheManager.get<QuotaStatus>(key);
     const current: QuotaStatus = currentRaw || {
       group,
@@ -168,8 +202,8 @@ export class AmazonApiService {
     if (status && status >= 200 && status < 300) {
       current.lastSuccessAt = now.toISOString();
       current.consecutive429Count = 0;
-      current.status = (current.cooldownUntil && new Date(current.cooldownUntil) > now) ? 'COOLDOWN' : 'OK';
-      
+      current.status = current.cooldownUntil && new Date(current.cooldownUntil) > now ? 'COOLDOWN' : 'OK';
+
       const limitHeader = headers?.['x-amzn-ratelimit-limit'];
       if (limitHeader) {
         current.lastRateLimitHeader = limitHeader;
@@ -205,7 +239,8 @@ export class AmazonApiService {
   }
 
   private getQuotaGroup(endpoint: string): QuotaGroup {
-    if (endpoint.includes('/reports/2021-06-30/reports') && !endpoint.match(/\/reports\/amzn1\./)) return QuotaGroup.CREATE_REPORT;
+    if (endpoint.includes('/reports/2021-06-30/reports') && !endpoint.match(/\/reports\/amzn1\./))
+      return QuotaGroup.CREATE_REPORT;
     if (endpoint.includes('/reports/2021-06-30/reports/')) return QuotaGroup.GET_REPORT;
     if (endpoint.includes('/reports/2021-06-30/documents/')) return QuotaGroup.GET_REPORT_DOCUMENT;
     if (endpoint.startsWith('http')) return QuotaGroup.DOWNLOAD_REPORT;
@@ -243,12 +278,11 @@ export class AmazonApiService {
     const baseUrl = this.authService.getApiBaseUrl();
     const urlObj = new URL(`${baseUrl}${endpoint}`);
     if (params) {
-      Object.keys(params).forEach(key => urlObj.searchParams.append(key, params[key]));
+      Object.keys(params).forEach((key) => urlObj.searchParams.append(key, params[key]));
     }
-    
+
     const isReportDocumentEndpoint = endpoint.includes('/reports/2021-06-30/documents/');
-    const MAX_RETRIES = isReportDocumentEndpoint ? 8 : 5;
-    const INITIAL_BACKOFF_MS = 1000;
+    const MAX_RETRIES = this.getMaxRetries(isReportDocumentEndpoint);
     let attempt = 0;
     let hasClearedTokenCache = false;
     let lastRetryError: any = null;
@@ -267,18 +301,18 @@ export class AmazonApiService {
         this.updateDynamicThrottle(response.headers);
         await this.updateQuotaStatus(endpoint, response);
         return response.data;
-
       } catch (error: any) {
         lastRetryError = error;
         const status = error.response?.status;
-        const errorData = JSON.stringify(error.response?.data || error.message);
-        
+        const safeDetails = this.safeErrorDetails(error);
+        const requestId = this.getRequestId(error);
+
         if (error.response?.headers) {
           this.updateDynamicThrottle(error.response.headers);
         }
         await this.updateQuotaStatus(endpoint, undefined, error);
 
-        if (status === 429 || (status >= 500 && status <= 599)) {
+        if (this.isTransientFailure(error)) {
           if (status === 429) {
             const retryAfter = error.response?.headers?.['retry-after'];
 
@@ -289,33 +323,45 @@ export class AmazonApiService {
             // every makeRequest() call, so 3 different documents each returning
             // one 429 will NOT trigger fail-fast; only 3 retries of the SAME
             // request (total ~195s of waiting) signals a truly exhausted quota.
-            if (attempt >= 3 && !isReportDocumentEndpoint && (endpoint.includes('/documents/') || endpoint.includes('/reports/'))) {
+            if (
+              attempt >= 3 &&
+              !isReportDocumentEndpoint &&
+              (endpoint.includes('/documents/') || endpoint.includes('/reports/'))
+            ) {
               this.logger.error(
                 `[RateLimit] Quota exhausted on ${endpoint} (${attempt} retries, all 429). ` +
-                `Failing fast — retry after quota refills (~15 min). ` +
-                `Amazon burst quota: 15 req total, refill 1/60s.`,
+                  `Failing fast — retry after quota refills (~15 min). ` +
+                  `Amazon burst quota: 15 req total, refill 1/60s.`,
               );
               throw error; // bubble up immediately — no more retries
             }
 
             let backoffMs = retryAfter
               ? (parseInt(retryAfter, 10) || 65) * 1000
-              : endpoint.includes('/reports/') ? 65_000 : 30_000;
+              : endpoint.includes('/reports/')
+                ? 65_000
+                : 30_000;
 
             if (isReportDocumentEndpoint && attempt >= 3) {
               backoffMs = 15 * 60 * 1000;
             }
 
-            this.logger.warn(`[RateLimit] 429 on ${endpoint}. Waiting ${backoffMs / 1000}s before retry ${attempt + 1}/${MAX_RETRIES}`);
+            this.logger.warn(
+              `[RateLimit] 429 on ${endpoint}. Waiting ${backoffMs / 1000}s before retry ${attempt + 1}/${MAX_RETRIES}`,
+            );
             await this.delay(backoffMs);
             attempt++;
             continue;
           }
 
-          // 5xx transient errors — exponential backoff
+          // Transient HTTP and network errors use exponential backoff with jitter.
           if (attempt < MAX_RETRIES) {
-            const backoffMs = INITIAL_BACKOFF_MS * Math.pow(2, attempt) + Math.floor(Math.random() * 500);
-            this.logger.warn(`[Transient] ${status} on ${endpoint}. Retrying in ${backoffMs}ms... (Attempt ${attempt + 1}/${MAX_RETRIES})`);
+            const backoffMs = this.exponentialBackoffMs(attempt);
+            this.logger.warn(
+              `[Transient] ${status || error.code || 'network error'} on ${endpoint}. ` +
+                `Retrying in ${backoffMs}ms (attempt ${attempt + 1}/${MAX_RETRIES})` +
+                `${requestId ? ` requestId=${requestId}` : ''}`,
+            );
             await this.delay(backoffMs);
             attempt++;
             continue;
@@ -324,16 +370,18 @@ export class AmazonApiService {
 
         if (status === 401 && !hasClearedTokenCache) {
           this.logger.warn(`Unauthorized (401). Clearing token cache and retrying...`);
-          this.authService.clearTokenCache();
+          await this.authService.clearTokenCache();
           hasClearedTokenCache = true;
           continue;
         }
 
         if (status === 403) {
-          this.logger.error("IAM Policy or Developer Profile Mismatch - Check AWS Console.");
+          this.logger.error('IAM Policy or Developer Profile Mismatch - Check AWS Console.');
         }
 
-        this.logger.error(`Amazon SP-API request failed [${status || 'No Response'}]: ${method} ${endpoint}`, maskSecret(errorData));
+        this.logger.error(
+          `Amazon SP-API request failed [${status || 'No Response'}]: ${method} ${endpoint} ${safeDetails}`,
+        );
         throw error;
       }
     }
@@ -383,11 +431,12 @@ export class AmazonApiService {
           allData.push(...records);
         }
 
+        this.logger.log(`[Pagination] page=${pageNum} fetched=${records.length}`);
         currentNextToken = tokenExtractor(response);
         pageNum++;
       } catch (error: any) {
-        this.logger.error(`Pagination stopped gracefully at page ${pageNum} due to error.`, maskSecret(error.message));
-        break;
+        this.logger.error(`Pagination failed at page ${pageNum}.`, this.safeErrorDetails(error));
+        throw error;
       }
     } while (currentNextToken);
 
@@ -411,10 +460,10 @@ export class AmazonApiService {
   ): Promise<any[]> {
     return this.getReportLimiter.schedule(async () => {
       const qs = new URLSearchParams({
-        reportTypes:         reportType,
-        processingStatuses:  'DONE',
-        marketplaceIds:      marketplaceId,
-        pageSize:            '5',   // cap — we only process the 3 newest anyway
+        reportTypes: reportType,
+        processingStatuses: 'DONE',
+        marketplaceIds: marketplaceId,
+        pageSize: '5', // cap — we only process the 3 newest anyway
         dataStartTime,
         dataEndTime,
       });
@@ -426,24 +475,21 @@ export class AmazonApiService {
       // and returns current-period reports instead of historical ones.
       // Validate each report's actual data period before accepting it.
       const reqStart = new Date(dataStartTime).getTime();
-      const reqEnd   = new Date(dataEndTime).getTime();
+      const reqEnd = new Date(dataEndTime).getTime();
       const filtered = reports.filter((r: any) => {
         if (!r.dataStartTime || !r.dataEndTime) return false;
-        return new Date(r.dataStartTime).getTime() >= reqStart &&
-               new Date(r.dataEndTime).getTime()   <= reqEnd;
+        return new Date(r.dataStartTime).getTime() >= reqStart && new Date(r.dataEndTime).getTime() <= reqEnd;
       });
 
       if (reports.length > 0 && filtered.length === 0) {
         this.logger.warn(
           `[Reports] Amazon returned ${reports.length} pre-generated report(s) but none matched ` +
-          `requested period ${dataStartTime} → ${dataEndTime}. Falling back to on-demand creation.`,
+            `requested period ${dataStartTime} → ${dataEndTime}. Falling back to on-demand creation.`,
         );
       }
 
       // Newest first
-      return filtered.sort((a: any, b: any) =>
-        new Date(b.createdTime).getTime() - new Date(a.createdTime).getTime(),
-      );
+      return filtered.sort((a: any, b: any) => new Date(b.createdTime).getTime() - new Date(a.createdTime).getTime());
     });
   }
 
@@ -485,14 +531,30 @@ export class AmazonApiService {
 
   async downloadAndParseReport(url: string, compressionAlgorithm?: string): Promise<any> {
     this.logger.debug(`Downloading report document from URL...`);
-    let response: AxiosResponse;
-    try {
-      response = await axios.get(url, { responseType: 'arraybuffer' });
-      await this.updateQuotaStatus(url, response);
-    } catch (error: any) {
-      await this.updateQuotaStatus(url, undefined, error);
-      throw error;
+    let response: AxiosResponse | undefined;
+    const maxRetries = this.getMaxRetries();
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        response = await axios.get(url, {
+          responseType: 'arraybuffer',
+          timeout: this.getTimeoutMs(),
+        });
+        await this.updateQuotaStatus(url, response);
+        break;
+      } catch (error: any) {
+        await this.updateQuotaStatus(url, undefined, error);
+        if (!this.isTransientFailure(error) || attempt >= maxRetries) {
+          this.logger.error(`[Download] Report download failed ${this.safeErrorDetails(error)}`);
+          throw error;
+        }
+        const backoffMs = this.exponentialBackoffMs(attempt);
+        this.logger.warn(
+          `[Download] Transient failure. Retrying in ${backoffMs}ms ` + `(attempt ${attempt + 1}/${maxRetries})`,
+        );
+        await this.delay(backoffMs);
+      }
     }
+    if (!response) throw new Error('Amazon report download ended without a response.');
     let data = response.data;
 
     if (compressionAlgorithm === 'GZIP') {
@@ -501,7 +563,7 @@ export class AmazonApiService {
     }
 
     const content = data.toString('utf-8');
-    
+
     // Try to parse as JSON first, then fallback to raw content (might be TSV)
     try {
       return JSON.parse(content);

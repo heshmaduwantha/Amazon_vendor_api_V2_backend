@@ -2,3 +2,5 @@
 dist/
 .env
 *.log
+amazon-inventory-backfill-checkpoint.json
+amazon-inventory-backfill-checkpoint.json.tmp

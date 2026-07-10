@@ -10,6 +10,7 @@ describe('InventoryService', () => {
   let repository: {
     create: jest.Mock;
     createQueryBuilder: jest.Mock;
+    find: jest.Mock;
   };
   let queryBuilder: {
     insert: jest.Mock;
@@ -28,14 +29,18 @@ describe('InventoryService', () => {
       execute: jest.fn().mockResolvedValue({}),
     };
     repository = {
-      create: jest.fn(entity => entity),
+      create: jest.fn((entity) => entity),
       createQueryBuilder: jest.fn(() => queryBuilder),
+      find: jest.fn().mockResolvedValue([]),
     };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         InventoryService,
-        { provide: getRepositoryToken(AmazonInventoryByAsin), useValue: repository },
+        {
+          provide: getRepositoryToken(AmazonInventoryByAsin),
+          useValue: repository,
+        },
         { provide: AmazonApiService, useValue: { normalizeDate: jest.fn() } },
         { provide: ConfigService, useValue: { get: jest.fn() } },
       ],
@@ -49,7 +54,7 @@ describe('InventoryService', () => {
   });
 
   it('upserts inventory by ASIN using the record period and composite conflict key', async () => {
-    await (service as any).upsertInventoryByAsin(
+    const prepared = service.prepareInventoryRecords(
       [
         {
           startDate: '2026-04-05',
@@ -67,6 +72,7 @@ describe('InventoryService', () => {
       '2026-04-01',
       '2026-04-30',
     );
+    const result = await service.loadInventoryRecords(prepared.records);
 
     expect(repository.create).toHaveBeenCalledTimes(2);
     expect(queryBuilder.values).toHaveBeenCalledWith([
@@ -95,6 +101,38 @@ describe('InventoryService', () => {
       ['start_date', 'end_date', 'asin'],
     );
     expect(queryBuilder.execute).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({
+      insertedCount: 2,
+      updatedCount: 0,
+      skippedCount: 0,
+    });
+  });
+
+  it('does not insert duplicates when the same business keys are loaded again', async () => {
+    const prepared = service.prepareInventoryRecords(
+      [
+        {
+          startDate: '2025-09-30',
+          endDate: '2025-09-30',
+          asin: 'B000TEST01',
+          openPurchaseOrderUnits: 5,
+        },
+      ],
+      '2025-09-30',
+      '2025-09-30',
+    );
+    repository.find.mockResolvedValueOnce([]).mockResolvedValueOnce(prepared.records);
+
+    const first = await service.loadInventoryRecords(prepared.records);
+    const second = await service.loadInventoryRecords(prepared.records);
+
+    expect(first.insertedCount).toBe(1);
+    expect(second).toEqual({
+      insertedCount: 0,
+      updatedCount: 0,
+      skippedCount: 1,
+    });
+    expect(queryBuilder.execute).toHaveBeenCalledTimes(1);
   });
 
   it('splits DAY inventory report ranges into Amazon-safe 15-day chunks', () => {
@@ -113,11 +151,9 @@ describe('InventoryService', () => {
       { startDate: '2026-04-01', endDate: '2026-04-30' },
     ]);
 
-    expect((service as any).getInventoryReportRanges(
-      '2026-04-01T00:00:00.000Z',
-      '2026-04-30T23:59:59.999Z',
-      'DAY',
-    )).toEqual([
+    expect(
+      (service as any).getInventoryReportRanges('2026-04-01T00:00:00.000Z', '2026-04-30T23:59:59.999Z', 'DAY'),
+    ).toEqual([
       { startDate: '2026-04-01', endDate: '2026-04-15' },
       { startDate: '2026-04-16', endDate: '2026-04-30' },
     ]);
