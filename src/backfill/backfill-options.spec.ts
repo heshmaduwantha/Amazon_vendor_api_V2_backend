@@ -51,4 +51,46 @@ describe('backfill options safety', () => {
       ]),
     ).toThrow('exactly match');
   });
+
+  it('supports separate checkpoint and job defaults without changing inventory defaults', () => {
+    const sales = parseBackfillOptions(
+      [...baseArguments, '--confirm-prod'],
+      new Date('2026-01-01T00:00:00Z'),
+      {
+        checkpointPath: './amazon-sales-backfill-checkpoint.json',
+        jobIdPrefix: 'amazon-sales',
+        useBackfillIdentityEnvironment: false,
+        dryRunSupported: false,
+      },
+    );
+
+    expect(
+      sales.checkpointPath.endsWith('amazon-sales-backfill-checkpoint.json'),
+    ).toBe(true);
+    expect(sales.jobId).toBe('amazon-sales-2025-09-01-2025-09-30-15d');
+
+    const inventory = parseBackfillOptions([
+      ...baseArguments,
+      '--confirm-prod',
+    ]);
+    expect(
+      inventory.checkpointPath.endsWith(
+        'amazon-inventory-backfill-checkpoint.json',
+      ),
+    ).toBe(true);
+    expect(inventory.jobId).toBe('amazon-inventory-2025-09-01-2025-09-30-15d');
+  });
+
+  it('rejects unsupported sales dry-run with the required error', () => {
+    expect(() =>
+      parseBackfillOptions([...baseArguments, '--dry-run'], new Date(), {
+        checkpointPath: './amazon-sales-backfill-checkpoint.json',
+        jobIdPrefix: 'amazon-sales',
+        useBackfillIdentityEnvironment: false,
+        dryRunSupported: false,
+      }),
+    ).toThrow(
+      'Sales backfill dry-run is not supported because SalesService.syncDailySales performs database upserts.',
+    );
+  });
 });

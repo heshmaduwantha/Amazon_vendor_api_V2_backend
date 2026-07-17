@@ -4,3 +4,5 @@ dist/
 *.log
 amazon-inventory-backfill-checkpoint.json
 amazon-inventory-backfill-checkpoint.json.tmp
+amazon-sales-backfill-checkpoint.json
+amazon-sales-backfill-checkpoint.json.tmp

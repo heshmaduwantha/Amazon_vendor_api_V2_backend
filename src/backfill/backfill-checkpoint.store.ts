@@ -4,9 +4,14 @@ import { BackfillChunk, chunkKey } from './backfill-date.util';
 
 export type BackfillChunkStatus = 'running' | 'success' | 'failed' | 'dry_run';
 
-export interface BackfillChunkCheckpoint extends BackfillChunk {
+export interface BaseBackfillChunkCheckpoint extends BackfillChunk {
   executionStartedAt: string;
   executionEndedAt: string | null;
+  status: BackfillChunkStatus;
+  errorSummary: string | null;
+}
+
+export interface BackfillChunkCheckpoint extends BaseBackfillChunkCheckpoint {
   fetchedCount: number;
   transformedCount: number;
   insertedCount: number;
@@ -15,27 +20,28 @@ export interface BackfillChunkCheckpoint extends BackfillChunk {
   failedCount: number;
   duplicateBusinessKeyCount: number;
   zeroDataDates: string[];
-  status: BackfillChunkStatus;
-  errorSummary: string | null;
 }
 
-interface BackfillJobCheckpoint {
+interface BackfillJobCheckpoint<
+  TChunkCheckpoint extends BaseBackfillChunkCheckpoint,
+> {
   jobId: string;
   requestedStartDate: string;
   requestedEndDate: string;
   chunkDays: number;
-  chunks: Record<string, BackfillChunkCheckpoint>;
+  chunks: Record<string, TChunkCheckpoint>;
 }
 
-interface CheckpointFile {
+interface CheckpointFile<TChunkCheckpoint extends BaseBackfillChunkCheckpoint> {
   version: 1;
-  jobs: Record<string, BackfillJobCheckpoint>;
+  jobs: Record<string, BackfillJobCheckpoint<TChunkCheckpoint>>;
 }
 
-const EMPTY_CHECKPOINT: CheckpointFile = { version: 1, jobs: {} };
-
-export class BackfillCheckpointStore {
-  private state: CheckpointFile = structuredClone(EMPTY_CHECKPOINT);
+export class BackfillCheckpointStore<
+  TChunkCheckpoint extends BaseBackfillChunkCheckpoint =
+    BackfillChunkCheckpoint,
+> {
+  private state: CheckpointFile<TChunkCheckpoint> = { version: 1, jobs: {} };
 
   constructor(private readonly path: string) {}
 
@@ -43,7 +49,7 @@ export class BackfillCheckpointStore {
     try {
       const parsed = JSON.parse(
         await readFile(this.path, 'utf8'),
-      ) as CheckpointFile;
+      ) as CheckpointFile<TChunkCheckpoint>;
       if (parsed.version !== 1 || !parsed.jobs)
         throw new Error('unsupported checkpoint format');
       this.state = parsed;
@@ -56,7 +62,7 @@ export class BackfillCheckpointStore {
         const message = error instanceof Error ? error.message : String(error);
         throw new Error(`Cannot read checkpoint ${this.path}: ${message}`);
       }
-      this.state = structuredClone(EMPTY_CHECKPOINT);
+      this.state = { version: 1, jobs: {} };
     }
   }
 
@@ -94,10 +100,7 @@ export class BackfillCheckpointStore {
     );
   }
 
-  async record(
-    jobId: string,
-    checkpoint: BackfillChunkCheckpoint,
-  ): Promise<void> {
+  async record(jobId: string, checkpoint: TChunkCheckpoint): Promise<void> {
     const job = this.state.jobs[jobId];
     if (!job)
       throw new Error(`Checkpoint job ${jobId} has not been initialized.`);

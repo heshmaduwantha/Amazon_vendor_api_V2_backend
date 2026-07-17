@@ -21,6 +21,18 @@ export interface BackfillOptions {
   jobId: string;
 }
 
+export interface BackfillOptionDefaults {
+  checkpointPath: string;
+  jobIdPrefix: string;
+  useBackfillIdentityEnvironment?: boolean;
+  dryRunSupported?: boolean;
+}
+
+const INVENTORY_BACKFILL_DEFAULTS: BackfillOptionDefaults = {
+  checkpointPath: './amazon-inventory-backfill-checkpoint.json',
+  jobIdPrefix: 'amazon-inventory',
+};
+
 type ArgumentMap = Map<string, string | boolean>;
 
 function parseArguments(argv: string[]): ArgumentMap {
@@ -49,13 +61,13 @@ function parseArguments(argv: string[]): ArgumentMap {
 function stringValue(
   args: ArgumentMap,
   name: string,
-  envName: string,
+  envName?: string,
   fallback?: string,
 ): string | undefined {
   const value = args.get(name);
   if (typeof value === 'boolean')
     throw new Error(`--${name} requires a value.`);
-  return value ?? process.env[envName] ?? fallback;
+  return value ?? (envName ? process.env[envName] : undefined) ?? fallback;
 }
 
 function flagValue(args: ArgumentMap, name: string): boolean {
@@ -83,6 +95,7 @@ function parseForceChunk(value?: string): BackfillChunk | undefined {
 export function parseBackfillOptions(
   argv: string[],
   today = new Date(),
+  defaults: BackfillOptionDefaults = INVENTORY_BACKFILL_DEFAULTS,
 ): BackfillOptions {
   const args = parseArguments(argv);
   const startDate = stringValue(
@@ -113,8 +126,10 @@ export function parseBackfillOptions(
     stringValue(
       args,
       'checkpoint-path',
-      'BACKFILL_CHECKPOINT_PATH',
-      './amazon-inventory-backfill-checkpoint.json',
+      defaults.useBackfillIdentityEnvironment === false
+        ? undefined
+        : 'BACKFILL_CHECKPOINT_PATH',
+      defaults.checkpointPath,
     )!,
   );
   const chunkDays = Number(chunkDaysRaw);
@@ -139,6 +154,12 @@ export function parseBackfillOptions(
     stringValue(args, 'force-chunk', 'AMAZON_BACKFILL_FORCE_CHUNK'),
   );
 
+  if (dryRun && defaults.dryRunSupported === false) {
+    throw new Error(
+      'Sales backfill dry-run is not supported because SalesService.syncDailySales performs database upserts.',
+    );
+  }
+
   if (!overrideSafetyBoundary && endDate >= existingDataStartDate) {
     throw new Error(
       `end_date ${endDate} reaches protected existing data beginning ${existingDataStartDate}. ` +
@@ -146,9 +167,11 @@ export function parseBackfillOptions(
     );
   }
   if (!dryRun && !confirmProd) {
-    throw new Error(
-      'Database writes require --confirm-prod. Use --dry-run to fetch without writing.',
-    );
+    const dryRunHint =
+      defaults.dryRunSupported === false
+        ? ''
+        : ' Use --dry-run to fetch without writing.';
+    throw new Error(`Database writes require --confirm-prod.${dryRunHint}`);
   }
   if (nonInteractive && !confirmProd && !dryRun) {
     throw new Error(
@@ -173,8 +196,10 @@ export function parseBackfillOptions(
   const jobId = stringValue(
     args,
     'job-id',
-    'AMAZON_BACKFILL_JOB_ID',
-    `amazon-inventory-${startDate}-${endDate}-${chunkDays}d`,
+    defaults.useBackfillIdentityEnvironment === false
+      ? undefined
+      : 'AMAZON_BACKFILL_JOB_ID',
+    `${defaults.jobIdPrefix}-${startDate}-${endDate}-${chunkDays}d`,
   )!;
 
   return {
@@ -210,4 +235,25 @@ Options:
   --override-safety-boundary
   --checkpoint-path PATH
   --job-id ID
+`;
+
+export const SALES_BACKFILL_HELP = `Amazon Vendor Sales Historical Backfill
+
+Usage:
+  npm run backfill:amazon-sales-history -- [options]
+
+Options:
+  --start-date YYYY-MM-DD
+  --end-date YYYY-MM-DD
+  --chunk-days 1..15
+  --confirm-prod
+  --non-interactive
+  --resume
+  --force-chunk YYYY-MM-DD:YYYY-MM-DD
+  --override-safety-boundary
+  --checkpoint-path PATH
+  --job-id ID
+
+Note:
+  Sales dry-run is not supported because the existing sales sync performs database upserts.
 `;

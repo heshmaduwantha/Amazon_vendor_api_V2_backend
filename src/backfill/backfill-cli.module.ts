@@ -3,7 +3,9 @@ import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { InventoryModule } from '../reports/inventory/inventory.module';
+import { SalesModule } from '../reports/sales/sales.module';
 import { AmazonHistoryBackfillService } from './amazon-history-backfill.service';
+import { AmazonSalesHistoryBackfillService } from './amazon-sales-history-backfill.service';
 
 @Module({
   imports: [
@@ -25,7 +27,8 @@ import { AmazonHistoryBackfillService } from './amazon-history-backfill.service'
       inject: [ConfigService],
     }),
     InventoryModule,
+    SalesModule,
   ],
-  providers: [AmazonHistoryBackfillService],
+  providers: [AmazonHistoryBackfillService, AmazonSalesHistoryBackfillService],
 })
 export class BackfillCliModule {}
